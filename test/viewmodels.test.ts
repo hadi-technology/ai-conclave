@@ -122,7 +122,7 @@ describe("modelFromReads", () => {
     problem: "solve X",
     criteria: "done when",
     routing: { mode: "auto", effective: "efficiency" },
-    seats: [{ seat: "a", status: "idle", headroom: "medium", capped: false, resetsAt: null }],
+    seats: [{ seat: "a", status: "idle", headroom: "medium", capped: false, resetsAt: null, tier: "cheap" }],
     headroom: [],
     gate: null
   };
@@ -164,6 +164,19 @@ describe("modelFromReads", () => {
     expect(m.units[0].title).toBe("u1");
     expect(m.units[0].status).toBe("done");
     expect(m.ledger.total).toBe(0.5);
+  });
+
+  it("reads the roster seat tier (schema 2) in the read-command fallback", () => {
+    const m = modelFromReads({ status });
+    expect(m.seats[0].tier).toBe("cheap");
+  });
+
+  it("omits tier (null) when the roster seat carries none (older engine)", () => {
+    const noTier: RunStatus = {
+      ...status,
+      seats: [{ seat: "a", status: "idle", headroom: "medium", capped: false, resetsAt: null }]
+    };
+    expect(modelFromReads({ status: noTier }).seats[0].tier).toBeNull();
   });
 
   it("empty bundle yields the empty model", () => {
@@ -214,6 +227,26 @@ describe("seatsTree + seatChip", () => {
 
   it("placeholder when no seats", () => {
     expect(seatsTree([])[0].label).toMatch(/no seats/i);
+  });
+
+  it("renders the tier when present, and omits it when null (schema 2 mapping)", () => {
+    const base = {
+      status: "idle",
+      paused: false,
+      headroom: "medium",
+      capped: false,
+      resetsAt: null,
+      cost: 0,
+      costMode: "exact",
+      turns: 0,
+      currentItem: null
+    };
+    const [withTier] = seatsTree([{ ...base, seat: "a", tier: "premium" }]);
+    expect(withTier.description).toContain("premium");
+    const [noTier] = seatsTree([{ ...base, seat: "b", tier: null }]);
+    expect(noTier.description).not.toContain("premium");
+    // sanity: still renders the seat with its other state, just no tier chip.
+    expect(noTier.description).toContain("headroom");
   });
 });
 

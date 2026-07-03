@@ -22,6 +22,7 @@ import {
   findingsToDiagnostics,
   findingMessage,
   navigableTarget,
+  resolveBuildTarget,
   type FindingSeverity
 } from "./viewmodels/findings.js";
 
@@ -56,18 +57,20 @@ export class FindingsManager {
    */
   async refresh(run: string): Promise<void> {
     this.collection.clear();
-    // Only squiggle files in a PROVENANCE-KNOWN target (a run driven this session).
-    // Squiggling a fallback tree could mark the wrong same-named file.
-    const nav = navigableTarget(this.ctx.knownBuildTargetFor(run));
+    const client = await this.ctx.resolveClient();
+    const report = await client.report(run);
+    // Only squiggle files in a PROVENANCE-KNOWN target: the run driven this session
+    // OR the engine-reported target/workingDir (schema 2, authoritative even for
+    // attached runs). Squiggling a fallback workspace tree could mark the wrong
+    // same-named file, so we refuse when neither is available.
+    const nav = navigableTarget(resolveBuildTarget(this.ctx.knownBuildTargetFor(run), report));
     if (!nav.ok) {
       this.ctx.output.appendLine(
-        `[findings] "${run}": build target not known this session — diagnostics suppressed (would risk wrong-tree squiggles).`
+        `[findings] "${run}": build target not known (no session target and none reported by the engine) — diagnostics suppressed (would risk wrong-tree squiggles).`
       );
       return;
     }
     const targetRoot = nav.target;
-    const client = await this.ctx.resolveClient();
-    const report = await client.report(run);
 
     const { byFile, unlocated } = findingsToDiagnostics(report.qaFindings, targetRoot);
     for (const [fsPath, descs] of byFile) {
@@ -84,7 +87,7 @@ export class FindingsManager {
 
     const located = report.qaFindings.length - unlocated;
     this.ctx.output.appendLine(
-      `[findings] "${run}": ${located} located → Problems panel, ${unlocated} without a file:line (contract gap; see docs/ENGINE-GAPS.md).`
+      `[findings] "${run}": ${located} located → Problems panel, ${unlocated} with no cited file:line (the reviewer named no path:line — nothing to squiggle).`
     );
   }
 
@@ -100,13 +103,13 @@ export class FindingsManager {
 
   /** QuickPick every finding; selecting one jumps to its file:line (or explains why not). */
   async showFindings(run: string): Promise<void> {
-    const nav = navigableTarget(this.ctx.knownBuildTargetFor(run));
+    const client = await this.ctx.resolveClient();
+    const report = await client.report(run);
+    const nav = navigableTarget(resolveBuildTarget(this.ctx.knownBuildTargetFor(run), report));
     if (!nav.ok) {
       throw new EngineError("finding_target_unknown", nav.reason, nav.hint);
     }
     const targetRoot = nav.target;
-    const client = await this.ctx.resolveClient();
-    const report = await client.report(run);
     if (report.qaFindings.length === 0) {
       vscode.window.showInformationMessage(`Conclave: no QA findings for "${run}" yet.`);
       return;
@@ -117,7 +120,7 @@ export class FindingsManager {
       const loc = findingLocation(f, targetRoot);
       return {
         label: `$(${f.verdict === "pass" ? "pass" : "warning"}) unit ${f.unitSeq} · ${f.severity} · ${f.reviewer}`,
-        description: loc ? vscode.workspace.asRelativePath(loc.fsPath) + `:${loc.line}` : "(no file:line — not navigable)",
+        description: loc ? vscode.workspace.asRelativePath(loc.fsPath) + `:${loc.line}` : "(no cited file:line — not navigable)",
         detail: findingMessage(f),
         finding: f,
         loc
@@ -131,7 +134,7 @@ export class FindingsManager {
     if (!pick) return;
     if (!pick.loc) {
       vscode.window.showWarningMessage(
-        `Conclave: that finding has no recoverable file:line (the engine's report --json omits file/line — see docs/ENGINE-GAPS.md).`
+        `Conclave: that finding has no cited file:line (the reviewer named no path:line, so there's nowhere to jump).`
       );
       return;
     }

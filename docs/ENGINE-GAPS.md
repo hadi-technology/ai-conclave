@@ -2,67 +2,60 @@
 
 E4 (native VS Code integration) is a thin client of the `wrk2gthr` engine's JSON
 contract (`docs/JSON-CONTRACT.md` in the engine repo). Building it surfaced places
-where the contract does not yet expose what an editor-native experience needs. Each
-gap below states **what E4 wanted**, **what the contract exposes today**, **how E4
-copes honestly right now**, and **the precise engine addition** that would let E4
-stop coping. None of these are worked around by touching the store — the extension
-never opens the DB (principle 2).
+where the contract did not expose what an editor-native experience needs. Each gap
+below states **what E4 wanted**, **what the contract exposes**, **how E4 copes**, and
+**the precise engine addition** that would let E4 stop coping. None of these are
+worked around by touching the store — the extension never opens the DB (principle 2).
+
+**Status (schema 2).** The engine's schema-2 bump **CLOSED gaps 1 and 2**, plus the
+two smaller gaps that were noted only in `TESTING.md` — **per-seat `tier`** (Seats
+column) and **`collab run stop`** (real engine-side cancel). The extension now
+consumes all of them (structured `file`/`line`, `workingDir`/`target`, roster `tier`,
+`run stop`). **Gap 3 — takeover pause/resume — remains the one open gap.**
 
 ---
 
-## Gap 1 — QA findings carry no `file` / `line`
+## Gap 1 — QA findings carry no `file` / `line` — ✅ CLOSED (schema 2)
 
 **Wanted:** click a cross-QA finding → jump to the exact `file:line`; show findings
 as native diagnostics/squiggles in the offending file.
 
-**Contract today:** `report --json` `qaFindings[]` are
-`{unitSeq, verdict, severity, reviewer, claim, evidence}` — verified against the
-engine's `src/orchestrator/report.ts` `reportData()` and the store's QA-finding row
-(`verdict, severity, reviewer_seat, claim, evidence`). **No `file`, no `line`.**
+**Contract now (schema 2):** `report --json` `qaFindings[]` gained `file` (string|null)
+and `line` (number|null), parsed conservatively by the engine at QA time
+(`src/orchestrator/report.ts` `parseFindingLocation` over `evidence`, fallback
+`claim`). Both are `null` when the reviewer cited no `path:line`.
 
-**How E4 copes:** a pure parser (`src/viewmodels/findings.ts` `parseLocationFromText`)
-recovers a `file:line` heuristically from the free-text `evidence`/`claim` (e.g. a
-`src/foo.ts:42` token, or `src/foo.ts line 42`). Findings that match become
-clickable QuickPick entries and `DiagnosticCollection` squiggles resolved against the
-run's build target. Findings with no recoverable token are still listed but are
-**not navigable and get no squiggle** — the count is reported to the user so the
-limitation is visible, not silent.
-
-**Engine addition needed:** add optional structured location to each finding —
-`file` (path relative to the run's build target) and `line` (1-based), e.g.
-`qaFindings[]: { …, file?: string, line?: number, endLine?: number }`. This is an
-**additive** field (no schemaVersion bump). The reviewer already cites a location in
-prose; capturing it structurally at QA time removes all heuristics.
+**How E4 consumes it:** `src/viewmodels/findings.ts` `findingLocation` now **prefers
+the structured `file`/`line`** — authoritative, no guessing — and only falls back to
+the free-text heuristic (`parseLocationFromText`) when the contract omits a location.
+Jump-to-finding and the `DiagnosticCollection` squiggles are now reliable. Findings
+where the reviewer cited nothing are still listed (count surfaced), simply not
+navigable — nothing to point at, not a bug.
 
 ---
 
-## Gap 2 — the run's build target / working dir is not in the contract
+## Gap 2 — the run's build target / working dir is not in the contract — ✅ CLOSED (schema 2)
 
 **Wanted:** resolve a finding's `file:line`, run `git` for a native diff, and open
 produced code — all of which need the absolute path of the **build target** (the
 scratch clone the fleet built in) and/or the run's `working_dir`.
 
-**Contract today:** neither `run status --json`, `report --json`, nor the watch
-snapshot exposes the run's `working_dir` or the execution `--target`. (The engine
-knows it — `run.working_dir` in the store, `--target` on `orchestrate` — but does not
-surface it.)
+**Contract now (schema 2):** `run status --json` and `report --json` gained
+`workingDir` (the run's absolute working dir) and `target` (the effective build
+target, or `null` when no `--target` was pinned) — authoritative, from the store.
 
-**How E4 copes:** the extension **tracks the target itself** for runs it drives this
-session (`targets` map in `extension.ts`, populated from E2's build-target
-resolution). For a run it did **not** start in this window (e.g. attach-only, or a
-run from a previous session), it falls back to `conclave.targetDir` then the
-workspace root — so diff/jump/takeover degrade gracefully with a clear error
-("Conclave only knows the target of runs it drove") instead of pointing at the wrong
-tree.
-
-**Engine addition needed:** expose the build target + working dir on the run reads,
-e.g. `run status --json` and `report --json` gain
-`target: string` (absolute execution target) and `workingDir: string`. Additive.
-Then E4 can resolve produced-code paths for **any** run, not only ones it launched.
+**How E4 consumes it:** `src/viewmodels/findings.ts` `resolveBuildTarget` resolves a
+run's produced-code target **provenance-correctly**: the session `targets` map (runs
+this window drove) **OR** the engine-reported `target` (fallback `workingDir`). Both
+are authoritative, so findings/diffs now work for **ATTACHED (non-driven) runs too**
+— without the wrong-tree risk. When neither is available the shells (findings + diff)
+**refuse** with a clear message; they **never** fall back to `conclave.targetDir` or
+the workspace root (a same-named file there would be a silent wrong-tree jump). The
+wrong-tree provenance guard (`navigableTarget`) is retained.
 
 ---
 
-## Gap 3 — takeover has no pause/resume action (the big one)
+## Gap 3 — takeover has no pause/resume action (the big one) — ⏳ STILL OPEN
 
 **Wanted (roadmap E4):** "Take over seat" → open interactive
 `claude --resume <session>` in an integrated terminal after signalling the harness to

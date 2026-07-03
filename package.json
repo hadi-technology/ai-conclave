@@ -106,9 +106,16 @@
         "category": "Conclave"
       },
       {
+        "command": "conclave.cancelRun",
+        "title": "Stop run (cancel)",
+        "category": "Conclave",
+        "icon": "$(stop-circle)"
+      },
+      {
         "command": "conclave.stopRun",
         "title": "Stop watching run",
-        "category": "Conclave"
+        "category": "Conclave",
+        "icon": "$(eye-closed)"
       },
       {
         "command": "conclave.attachRun",
@@ -208,9 +215,19 @@
           "group": "inline@1"
         },
         {
-          "command": "conclave.stopRun",
+          "command": "conclave.cancelRun",
           "when": "view == conclave.runsView && viewItem == conclaveRunActive",
           "group": "inline@2"
+        },
+        {
+          "command": "conclave.cancelRun",
+          "when": "view == conclave.runsView && viewItem == conclaveRunActive",
+          "group": "conclave@0"
+        },
+        {
+          "command": "conclave.stopRun",
+          "when": "view == conclave.runsView && viewItem == conclaveRunActive",
+          "group": "conclave@0"
         },
         {
           "command": "conclave.openReport",

@@ -28,8 +28,29 @@ import {
   parseNameOnly,
   type DiffRefs
 } from "./viewmodels/diffref.js";
+import { resolveBuildTarget } from "./viewmodels/findings.js";
 
 const execFileAsync = promisify(execFile);
+
+/** Resolve the run's produced-code build target from a PROVENANCE-CORRECT source:
+ *  the session `targets` map OR the engine-reported target/workingDir (schema 2).
+ *  Refuses (throws) when neither is available — never falls back to the workspace
+ *  root, which could point git at an arbitrary same-named tree. */
+function requireBuildTarget(
+  ctx: ConclaveContext,
+  run: string,
+  contract: { target?: string | null; workingDir?: string | null }
+): string {
+  const cwd = resolveBuildTarget(ctx.knownBuildTargetFor(run), contract);
+  if (!cwd) {
+    throw new EngineError(
+      "build_target_unknown",
+      `Conclave doesn't know the build target for "${run}"`,
+      "Drive this run from here (or set conclave.targetDir) so its produced code resolves against the real build tree — not an arbitrary same-named path."
+    );
+  }
+  return cwd;
+}
 
 async function git(cwd: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
   try {
@@ -95,7 +116,7 @@ async function openDiffForRefs(ctx: ConclaveContext, cwd: string, refs: DiffRefs
 export async function reviewUnit(ctx: ConclaveContext, run: string, unitSeq?: number): Promise<void> {
   const client = await ctx.resolveClient();
   const report = await client.report(run);
-  const cwd = ctx.buildTargetFor(run);
+  const cwd = requireBuildTarget(ctx, run, report);
 
   const committed = report.units.filter((u) => u.commit);
   if (committed.length === 0) {
@@ -127,7 +148,7 @@ export async function reviewUnit(ctx: ConclaveContext, run: string, unitSeq?: nu
 export async function openIntegrationDiff(ctx: ConclaveContext, run: string): Promise<void> {
   const client = await ctx.resolveClient();
   const report: Report = await client.report(run);
-  const cwd = ctx.buildTargetFor(run);
+  const cwd = requireBuildTarget(ctx, run, report);
   const base = await resolveIntegrationBase(cwd);
   const refs = resolveIntegrationDiffRefs(report.merges, base);
   if (!refs) {
@@ -141,7 +162,11 @@ export async function openIntegrationDiff(ctx: ConclaveContext, run: string): Pr
 
 /** Command (3b): reveal the build target / integration branch in the OS/SCM. */
 export async function revealBuildTarget(ctx: ConclaveContext, run: string): Promise<void> {
-  const cwd = ctx.buildTargetFor(run);
+  // Resolve provenance-correctly: session target OR the engine-reported
+  // target/workingDir (schema 2). No workspace-root fallback.
+  const client = await ctx.resolveClient();
+  const status = await client.runStatus(run).catch(() => null);
+  const cwd = requireBuildTarget(ctx, run, status ?? {});
   const uri = vscode.Uri.file(cwd);
   // Open the target folder in the OS file manager; also log the branch for SCM use.
   const branch = (await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();

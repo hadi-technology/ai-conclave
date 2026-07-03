@@ -25,7 +25,8 @@ export function registerCommands(context: vscode.ExtensionContext, ctx: Conclave
   reg("conclave.openReport", () => openReport(ctx));
   reg("conclave.showLedger", () => showLedger(ctx));
   reg("conclave.approveGate", () => resolveGate(ctx));
-  reg("conclave.stopRun", (arg) => stopRun(ctx, arg));
+  reg("conclave.cancelRun", (arg) => cancelRunCmd(ctx, arg));
+  reg("conclave.stopRun", (arg) => stopWatchingCmd(ctx, arg));
   reg("conclave.attachRun", () => attachRun(ctx));
   reg("conclave.openRun", (arg) => openRun(ctx, arg));
   reg("conclave.focusRun", () => focusRun(ctx));
@@ -234,22 +235,34 @@ async function resolveGate(ctx: ConclaveContext): Promise<void> {
     runRef: run,
     log: (l) => ctx.output.appendLine(`[gate] ${l}`),
     openReport: (r) => openReportForRun(ctx, r),
-    stop: (r) => ctx.stopRun(r)
+    stop: (r) => {
+      void ctx.cancelRun(r);
+    }
   });
 }
 
-async function stopRun(ctx: ConclaveContext, arg: unknown): Promise<void> {
+/** CANCEL a run: engine-side terminal stop (`collab run stop`) + tear down the
+ *  orchestrate child. Distinct from "Stop watching", which only detaches the viewer. */
+async function cancelRunCmd(ctx: ConclaveContext, arg: unknown): Promise<void> {
+  const client = await ctx.resolveClient();
+  const run = argRunRef(arg) ?? (await pickRun(client, "Stop (cancel) which run?"));
+  const driving = ctx.orchestrators.has(run);
+  await ctx.cancelRun(run);
+  vscode.window.showInformationMessage(
+    `Conclave: stopped "${run}" — engine marked it terminally stopped (won't resume)${driving ? "; driving child terminated" : ""}.`
+  );
+}
+
+/** STOP WATCHING: detach the live viewer only. The run keeps running. */
+async function stopWatchingCmd(ctx: ConclaveContext, arg: unknown): Promise<void> {
   const client = await ctx.resolveClient();
   const run = argRunRef(arg) ?? (await pickRun(client, "Stop watching which run?"));
-  const driving = ctx.orchestrators.has(run);
   const watching = ctx.watchers.has(run);
-  ctx.stopRun(run);
-  if (driving || watching) {
-    vscode.window.showInformationMessage(`Conclave: stopped "${run}" (${driving ? "orchestrate + " : ""}watch detached).`);
+  ctx.stopWatching(run);
+  if (watching) {
+    vscode.window.showInformationMessage(`Conclave: stopped watching "${run}" (viewer detached; the run keeps running).`);
   } else {
-    vscode.window.showWarningMessage(
-      `Conclave: nothing local to stop for "${run}". Engine-side run cancellation is not yet in the JSON contract.`
-    );
+    vscode.window.showWarningMessage(`Conclave: not watching "${run}" — nothing to detach.`);
   }
 }
 

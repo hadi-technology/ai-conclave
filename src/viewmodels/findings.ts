@@ -1,14 +1,15 @@
 /**
  * QA findings → editor navigation + Problems-panel diagnostics (E4, pure half).
  *
- * IMPORTANT contract nuance: the engine's `report --json` qaFindings carry
- * `{unitSeq, verdict, severity, reviewer, claim, evidence}` — they do NOT carry an
- * explicit `file` or `line` field (verified against wrk2gthr
- * src/orchestrator/report.ts `reportData`). So a navigable location has to be
- * recovered heuristically from the free-text `claim`/`evidence` (e.g. a
- * "src/foo.ts:42" token). Findings with no recoverable location are still shown
- * in the findings list but cannot be a jump target or an inline squiggle — that
- * limitation is a documented engine gap (docs/ENGINE-GAPS.md), not a bug here.
+ * Contract (schema 2): each `report --json` qaFinding now carries structured
+ * `file` + `line` (parsed by the engine at QA time from the reviewer's cited
+ * `path:line`; both null when none was cited). We PREFER that structured location
+ * — it makes jump-to-finding reliable — and fall back to the free-text heuristic
+ * (`parseLocationFromText` over `evidence`/`claim`) ONLY when the contract omits
+ * it (older engines, or a finding with no cited location). Findings with neither a
+ * structured nor a recoverable location are still shown in the list but cannot be
+ * a jump target or an inline squiggle — that residual limitation is surfaced to
+ * the user (a count), not a silent drop.
  *
  * All functions here are pure (no vscode, no fs) so they are unit-testable
  * headlessly. The vscode shell (src/findings.ts) turns these descriptors into
@@ -44,12 +45,11 @@ export interface DiagnosticDescriptor {
 
 /**
  * Provenance gate for NAVIGATION: a finding may only open/squiggle a file when the
- * run's build target is KNOWN (a run driven this session, tracked in the `targets`
- * map). For a run whose target we don't know, `buildTargetFor` falls back to
- * conclave.targetDir → the workspace root — and a same-named file there would be a
- * SILENT wrong-tree jump. So navigation resolves only against a provenance-known
- * target; otherwise it refuses with the same clear message the diff path uses.
- * Pure + testable; the shell supplies `knownTarget = targets.get(run) ?? null`.
+ * run's build target is provenance-KNOWN. The shell supplies that target from
+ * {@link resolveBuildTarget} — the session `targets` map OR the engine-reported
+ * `target`/`workingDir` (schema 2), both authoritative. When none is available the
+ * gate refuses (rather than falling back to conclave.targetDir → the workspace
+ * root, where a same-named file would be a SILENT wrong-tree jump). Pure + testable.
  */
 export function navigableTarget(
   knownTarget: string | null | undefined
@@ -89,16 +89,55 @@ export function parseLocationFromText(text: string): { file: string; line: numbe
 
 /**
  * Resolve a finding to an absolute file location under the run's build target.
- * Scans `evidence` first (usually where the reviewer cites the offending line),
+ *
+ * PREFERS the contract's structured `file`/`line` (schema 2) — authoritative, no
+ * guessing. Falls back to the heuristic ONLY when the contract omits a location:
+ * scans `evidence` first (usually where the reviewer cites the offending line),
  * then `claim`. Absolute paths are kept as-is; relative paths join the target
- * root. Returns null when no location is recoverable (non-navigable finding).
+ * root. Returns null when neither a structured nor a recoverable location exists.
  */
 export function findingLocation(finding: QaFinding, targetRoot: string): FindingLocation | null {
+  // 1) Structured contract location wins when present.
+  if (typeof finding.file === "string" && finding.file.trim()) {
+    const line = typeof finding.line === "number" && finding.line > 0 ? finding.line : 1;
+    return { fsPath: resolveUnderTarget(finding.file, targetRoot), line, raw: `${finding.file}:${line}` };
+  }
+  // 2) Fall back to recovering a location from the free-text prose.
   const hit = parseLocationFromText(finding.evidence) ?? parseLocationFromText(finding.claim);
   if (!hit) return null;
-  const file = hit.file.replace(/\\/g, "/");
-  const fsPath = isAbsolute(file) ? normalize(file) : normalize(join(targetRoot, file));
-  return { fsPath, line: hit.line > 0 ? hit.line : 1, raw: hit.raw };
+  return { fsPath: resolveUnderTarget(hit.file, targetRoot), line: hit.line > 0 ? hit.line : 1, raw: hit.raw };
+}
+
+/** Resolve a finding's path against the build target: absolute kept as-is,
+ *  relative joined under the target root. Backslashes normalized to `/`. */
+function resolveUnderTarget(file: string, targetRoot: string): string {
+  const clean = file.replace(/\\/g, "/");
+  return isAbsolute(clean) ? normalize(clean) : normalize(join(targetRoot, clean));
+}
+
+/**
+ * Provenance-correct build-target resolution for a run's PRODUCED CODE.
+ *
+ * Priority (all authoritative — never an arbitrary same-named tree):
+ *   1. `sessionTarget` — the target the extension itself drove this run into
+ *      (the `targets` map). Highest trust.
+ *   2. `contract.target` — the engine-reported effective build target (schema 2).
+ *      Authoritative even for runs this session did NOT drive (attach-only).
+ *   3. `contract.workingDir` — the run's working dir, as a last authoritative
+ *      fallback when no `--target` was pinned.
+ * Returns null when none is available — the caller MUST then refuse (never fall
+ * back to the workspace root, which risks a silent wrong-tree jump/squiggle).
+ */
+export function resolveBuildTarget(
+  sessionTarget: string | null | undefined,
+  contract: { target?: string | null; workingDir?: string | null } | null | undefined
+): string | null {
+  if (sessionTarget && sessionTarget.trim()) return sessionTarget;
+  const t = contract?.target;
+  if (typeof t === "string" && t.trim()) return t;
+  const wd = contract?.workingDir;
+  if (typeof wd === "string" && wd.trim()) return wd;
+  return null;
 }
 
 /** Map a finding's severity/verdict to a diagnostic bucket. A failing verdict is

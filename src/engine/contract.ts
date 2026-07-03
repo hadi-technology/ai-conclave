@@ -66,6 +66,10 @@ export interface SeatRow {
   headroom: string;
   capped: boolean;
   resetsAt: string | null;
+  /** Schema 2 (additive): the seat's most-recent ledger tier, or null. Present on
+   *  the `status --json` roster; may be absent on older engines / the run-status
+   *  seat rows — read defensively. */
+  tier?: string | null;
 }
 
 export interface RoutingInfo {
@@ -85,6 +89,12 @@ export interface RunStatus extends SchemaStamped {
   id: number;
   phase: string;
   status: string;
+  /** Schema 2 (additive): the run's absolute `working_dir` (set at run start). */
+  workingDir?: string;
+  /** Schema 2 (additive): the effective build target (scratch clone the fleet
+   *  built in) — persisted when a drive passed `--target`, else null. Lets a client
+   *  locate produced code for runs it did NOT drive. */
+  target?: string | null;
   epsilon: number;
   problem: string;
   criteria: string;
@@ -113,6 +123,11 @@ export interface QaFinding {
   reviewer: string;
   claim: string;
   evidence: string;
+  /** Schema 2 (additive): structured location parsed at QA time from `evidence`
+   *  (fallback `claim`). Both null when the reviewer cited no `path:line`. When
+   *  present, PREFER these over re-parsing the prose. */
+  file?: string | null;
+  line?: number | null;
 }
 
 export interface LedgerRow {
@@ -132,6 +147,10 @@ export interface Report extends SchemaStamped {
   problem: string;
   phase: string;
   status: string;
+  /** Schema 2 (additive): run's working dir + effective build target (or null) —
+   *  same semantics as on `run status --json`. */
+  workingDir?: string;
+  target?: string | null;
   seats: string[];
   units: ReportUnit[];
   qaFindings: QaFinding[];
@@ -246,6 +265,14 @@ export interface BudgetRaiseResult extends ActionSuccess {
   budgetUsd: number;
   gateCleared: boolean;
   resumed: boolean;
+}
+
+/** `collab run stop [run] --json` (new at schema 2) — marks the run terminally
+ *  stopped so a later resume never re-drives it. */
+export interface RunStopResult extends ActionSuccess {
+  run: string;
+  /** Terminal status the engine sets — "stopped". */
+  status: string;
 }
 
 // ── Watch feed (collab watch --json) — JSONL line types ──────────────────────

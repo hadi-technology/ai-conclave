@@ -357,7 +357,9 @@ export function modelFromReads(b: ReadBundle): RunModel {
     seat: row.seat,
     status: row.status,
     paused: false,
-    tier: null,
+    // Schema 2: the roster now carries the seat's most-recent tier (null until the
+    // seat has taken a turn). Read defensively — older engines omit it.
+    tier: typeof row.tier === "string" ? row.tier : null,
     headroom: row.headroom,
     capped: row.capped,
     resetsAt: null,

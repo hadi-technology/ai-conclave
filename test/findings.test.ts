@@ -12,7 +12,8 @@ import {
   findingMessage,
   findingToDiagnostic,
   findingsToDiagnostics,
-  navigableTarget
+  navigableTarget,
+  resolveBuildTarget
 } from "../src/viewmodels/findings.js";
 import type { QaFinding } from "../src/engine/contract.js";
 
@@ -79,6 +80,77 @@ describe("findingLocation", () => {
   it("clamps a zero/negative line to 1", () => {
     const loc = findingLocation(finding({ evidence: "src/z.ts:0" }), "/t");
     expect(loc?.line).toBe(1);
+  });
+});
+
+describe("findingLocation — prefers structured contract file/line (schema 2)", () => {
+  it("uses the structured file/line directly, resolving a relative path under the target", () => {
+    const loc = findingLocation(finding({ file: "src/parser.ts", line: 42 }), "/tmp/build-run");
+    expect(loc).toEqual({ fsPath: "/tmp/build-run/src/parser.ts", line: 42, raw: "src/parser.ts:42" });
+  });
+
+  it("keeps a structured absolute path as-is", () => {
+    const loc = findingLocation(finding({ file: "/abs/y.ts", line: 9 }), "/tmp/build");
+    expect(loc?.fsPath).toBe("/abs/y.ts");
+    expect(loc?.line).toBe(9);
+  });
+
+  it("structured file WINS over a different location cited in the prose", () => {
+    // evidence prose points at src/prose.ts:99, but the structured field is authoritative.
+    const loc = findingLocation(
+      finding({ file: "src/structured.ts", line: 7, evidence: "actually see src/prose.ts:99" }),
+      "/t"
+    );
+    expect(loc).toEqual({ fsPath: "/t/src/structured.ts", line: 7, raw: "src/structured.ts:7" });
+  });
+
+  it("structured file with null/zero line clamps to line 1", () => {
+    expect(findingLocation(finding({ file: "src/x.ts", line: null }), "/t")?.line).toBe(1);
+    expect(findingLocation(finding({ file: "src/x.ts", line: 0 }), "/t")?.line).toBe(1);
+  });
+
+  it("FALLS BACK to the prose heuristic when the contract omits file/line", () => {
+    // file/line null (engine cited no path:line) → recover from evidence text.
+    const loc = findingLocation(finding({ file: null, line: null, evidence: "off-by-one at src/x.ts:5" }), "/tmp/b");
+    expect(loc).toEqual({ fsPath: "/tmp/b/src/x.ts", line: 5, raw: "src/x.ts:5" });
+  });
+
+  it("returns null when neither structured nor prose location exists", () => {
+    expect(findingLocation(finding({ file: null, line: null, claim: "vague", evidence: "vague" }), "/t")).toBeNull();
+  });
+});
+
+describe("resolveBuildTarget — provenance-correct target (session OR engine contract)", () => {
+  it("prefers the session target over the engine-reported one", () => {
+    expect(resolveBuildTarget("/session/target", { target: "/engine/target", workingDir: "/wd" })).toBe(
+      "/session/target"
+    );
+  });
+
+  it("uses the engine-reported target for a run NOT driven this session", () => {
+    expect(resolveBuildTarget(null, { target: "/engine/target", workingDir: "/wd" })).toBe("/engine/target");
+  });
+
+  it("falls back to workingDir when no session target and no engine target", () => {
+    expect(resolveBuildTarget(null, { target: null, workingDir: "/run/working_dir" })).toBe("/run/working_dir");
+  });
+
+  it("refuses (null) when nothing authoritative is available — never an arbitrary tree", () => {
+    expect(resolveBuildTarget(null, { target: null, workingDir: null })).toBeNull();
+    expect(resolveBuildTarget(undefined, undefined)).toBeNull();
+    expect(resolveBuildTarget(null, null)).toBeNull();
+  });
+
+  it("ignores blank/whitespace values at every level", () => {
+    expect(resolveBuildTarget("   ", { target: "  ", workingDir: "/real" })).toBe("/real");
+    expect(resolveBuildTarget("", { target: "", workingDir: "" })).toBeNull();
+  });
+
+  it("resolved contract target then navigates a finding under THAT tree", () => {
+    const target = resolveBuildTarget(null, { target: "/attached/build", workingDir: "/wd" });
+    expect(target).toBe("/attached/build");
+    const loc = findingLocation(finding({ file: "src/a.ts", line: 3 }), target as string);
+    expect(loc?.fsPath).toBe("/attached/build/src/a.ts");
   });
 });
 

@@ -54,15 +54,18 @@ Then **Conclave: Show runs** — lists recent runs from the engine (there are se
 
 ## 6. Native integration (after a run has built something)
 
-- Click a **QA finding** → jumps to `file:line` in the build target (findings also appear in the **Problems** panel). *Note: the engine doesn't yet emit structured file/line for findings — location is best-effort; see `ENGINE-GAPS.md`.*
+- Click a **QA finding** → jumps to the exact `file:line` in the build target (findings also appear in the **Problems** panel). *Schema 2: the engine now emits structured `file`/`line` per finding, so the jump is reliable — the prose heuristic is only a fallback when the reviewer cited no location.*
+- Findings and diffs now resolve for **attached (non-driven) runs too**: the engine reports each run's `target`/`workingDir`, so Conclave can locate produced code even for runs it didn't start this session (still refusing — never guessing a wrong tree — when neither a session target nor an engine-reported one exists).
 - **Conclave: Open integration diff** → the produced change in VS Code's native diff viewer.
-- **Conclave: Take over seat** → opens an integrated terminal and *stages* the seat's `--resume` command (doesn't auto-run). *Full pause/resume takeover needs an engine addition — see `ENGINE-GAPS.md`.*
+- **Conclave: Stop run (cancel)** → terminally cancels the run engine-side (`collab run stop`, so a resume won't re-drive it) and SIGTERMs the driving child. Distinct from **Conclave: Stop watching run**, which only detaches the live viewer (the run keeps going).
+- The **Seats** view now shows each seat's **tier** (schema 2 roster/snapshot field).
+- **Conclave: Take over seat** → opens an integrated terminal and *stages* the seat's `--resume` command (doesn't auto-run). *Full pause/resume takeover still needs an engine addition — the one remaining gap; see `ENGINE-GAPS.md`.*
 
 ## What's verified vs what needs your eyes
 
-- **Verified headlessly (this build):** every pure logic path — engine-client envelope parsing, watch feed, view-models, gate wiring, spend-preflight, scratch-target safety, Kanban column mapping, webview isolation, diff-ref resolution, finding location, takeover honesty — **~150 automated tests across the extension + the engine contract**, plus valid `.vsix` packaging.
+- **Verified headlessly (this build):** every pure logic path — engine-client envelope parsing (incl. schema-agnostic compat + `run stop`), watch feed, view-models, gate wiring, spend-preflight, scratch-target safety, Kanban column mapping, webview isolation, diff-ref resolution, finding location (structured-first + heuristic fallback), provenance-correct build-target resolution, seat-tier mapping, stop-vs-detach logic, takeover honesty — **175 automated tests across the extension + the engine contract**, plus valid `.vsix` packaging.
 - **Needs your GUI test (can't be done headlessly):** actual rendering and interaction in a live editor on **both VS Code and Cursor** — the sidebar views, the cockpit Kanban animations, notification buttons resolving a real gate, the diff viewer, the takeover terminal. Everything is wired over tested cores; this confirms the pixels and clicks.
 
 ## Known engine gaps (see `docs/ENGINE-GAPS.md`)
 
-Small engine-side additions that would upgrade specific features (none block testing the core): structured `file`/`line` on QA findings; the run's build `target` in the read JSON; a `collab seat pause/resume` action for full takeover; a `collab run stop` command; per-seat tier in the snapshot (Seats "tier" column).
+Schema 2 **closed** most of the earlier gaps — structured `file`/`line` on QA findings, the run's `target`/`workingDir` in the read JSON, per-seat `tier` on the roster/snapshot (Seats "tier" column), and a real `collab run stop` cancel — all now consumed by the extension. **One gap remains:** a `collab seat pause/resume` action for the full one-click takeover round-trip (today's takeover is the honest terminal hatch that stages the `--resume` command). See `docs/ENGINE-GAPS.md`.

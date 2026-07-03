@@ -23,6 +23,7 @@ import type {
   Report,
   RunStartResult,
   RunStatus,
+  RunStopResult,
   RunsResponse,
   VersionInfo
 } from "./contract.js";
@@ -198,6 +199,13 @@ export class EngineClient {
     if (opts.feedback) args.push("--feedback", opts.feedback);
     if (opts.run) args.push("--run", opts.run);
     return this.runJson<GateApproveResult>(args);
+  }
+
+  /** Mark a run terminally stopped (engine-side cancel) so a later resume won't
+   *  re-drive it. Wraps `collab run stop [run] --json`. The separately-running
+   *  orchestrate child is the caller's own to SIGTERM. */
+  runStop(run?: string): Promise<RunStopResult> {
+    return this.runJson<RunStopResult>(run ? ["run", "stop", run] : ["run", "stop"]);
   }
 
   gateReject(opts: { run?: string; feedback: string }): Promise<GateRejectResult> {

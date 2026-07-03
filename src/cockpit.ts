@@ -161,7 +161,9 @@ export class CockpitPanel {
         runRef: run,
         log: (l) => this.ctx.output.appendLine(`[cockpit gate] ${l}`),
         openReport: (r) => openReportForRun(this.ctx, r),
-        stop: (r) => this.ctx.stopRun(r)
+        stop: (r) => {
+          void this.ctx.cancelRun(r);
+        }
       });
     } catch (err) {
       vscode.window.showErrorMessage(`Conclave: ${err instanceof Error ? err.message : String(err)}`);

@@ -25,6 +25,7 @@ import { FindingsManager } from "./findings.js";
 import { reviewUnit, openIntegrationDiff, revealBuildTarget } from "./diffReview.js";
 import { takeoverSeat } from "./takeover.js";
 import { emptyModel, type RunModel } from "./viewmodels/model.js";
+import { planCancelRun, planStopWatching } from "./viewmodels/stop.js";
 import { planBuildTarget } from "./viewmodels/startRun.js";
 import { prepareBuildTarget } from "./buildTarget.js";
 import { scratchRoot } from "./startRunFlow.js";
@@ -63,8 +64,11 @@ export interface ConclaveContext {
   /** Spawn the orchestrate child that drives a run. `target` is the pre-prepared
    *  build dir (from the start-run flow); when absent, a safe one is resolved. */
   driveRun(runRef: string, opts?: { fullAuto?: boolean; target?: string }): Promise<void>;
-  /** Stop driving + watching a run. */
-  stopRun(runRef: string): void;
+  /** CANCEL a run: engine-side terminal stop (`collab run stop`, so a resume never
+   *  re-drives it) + SIGTERM the managed orchestrate child. Leaves the viewer. */
+  cancelRun(runRef: string): Promise<void>;
+  /** Detach the live watch viewer only — the run (and any driving) keeps going. */
+  stopWatching(runRef: string): void;
 }
 
 let cachedProvision: { signature: string; result: ProvisionResult } | undefined;
@@ -166,7 +170,9 @@ export function activate(context: vscode.ExtensionContext): void {
           runRef,
           log: (l) => output.appendLine(`[gate] ${l}`),
           openReport: (r) => openReportForRun(ctx, r),
-          stop: (r) => stopRun(r)
+          stop: (r) => {
+            void cancelRun(r);
+          }
         });
       });
       bus = b;
@@ -240,18 +246,43 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   }
 
-  function stopRun(runRef: string): void {
-    const controller = orchestrators.get(runRef);
-    if (controller) {
-      controller.stop();
-      orchestrators.delete(runRef);
-      output.appendLine(`[conclave] stopped driving "${runRef}".`);
+  /** CANCEL a run — engine-side terminal stop + tear down the orchestrate child.
+   *  Per {@link planCancelRun}: always asks the engine (idempotent, works for
+   *  attached-only runs); kills the child only when we're driving; leaves the
+   *  viewer attached so the user watches it wind down. */
+  async function cancelRun(runRef: string): Promise<void> {
+    const plan = planCancelRun({ driving: orchestrators.has(runRef), watching: watchers.has(runRef) });
+    if (plan.engineStop) {
+      try {
+        const client = new EngineClient(await resolveClientConfig());
+        const res = await client.runStop(runRef);
+        output.appendLine(`[conclave] engine marked "${runRef}" ${res.status} (won't resume).`);
+      } catch (err) {
+        output.appendLine(
+          `[conclave] engine run stop for "${runRef}" failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
-    const w = watchers.get(runRef);
-    if (w) {
-      w.stop();
-      watchers.delete(runRef);
-      output.appendLine(`[conclave] detached live watch for "${runRef}".`);
+    if (plan.killOrchestrate) {
+      const controller = orchestrators.get(runRef);
+      if (controller) {
+        controller.stop();
+        orchestrators.delete(runRef);
+        output.appendLine(`[conclave] stopped driving "${runRef}" (SIGTERM).`);
+      }
+    }
+  }
+
+  /** Detach the live watch viewer only (per {@link planStopWatching}). */
+  function stopWatching(runRef: string): void {
+    const plan = planStopWatching({ driving: orchestrators.has(runRef), watching: watchers.has(runRef) });
+    if (plan.detachWatch) {
+      const w = watchers.get(runRef);
+      if (w) {
+        w.stop();
+        watchers.delete(runRef);
+        output.appendLine(`[conclave] detached live watch for "${runRef}".`);
+      }
     }
   }
 
@@ -268,7 +299,8 @@ export function activate(context: vscode.ExtensionContext): void {
     ensureBus,
     focusRun,
     driveRun,
-    stopRun
+    cancelRun,
+    stopWatching
   };
 
   // ── Views + status bar ───────────────────────────────────────────────────────

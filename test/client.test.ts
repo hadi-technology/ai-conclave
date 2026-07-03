@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { EngineClient } from "../src/engine/client.js";
 import { EngineError } from "../src/engine/errors.js";
+import { CLIENT_SCHEMA_VERSION } from "../src/engine/contract.js";
 import { provisionForTests, seedStore, type SeededStore } from "./helpers.js";
 
 let seed: SeededStore;
@@ -24,11 +25,17 @@ afterAll(() => {
 });
 
 describe("EngineClient — typed read envelopes", () => {
-  it("version() parses the compatibility payload", async () => {
+  it("version() parses the compatibility payload (schema-agnostic)", async () => {
     const v = await client.version();
-    expect(v.schemaVersion).toBe(1);
+    // Do NOT hardcode schemaVersion — it is a monotonic feature level that advances
+    // additively (engine is at 2, may go higher). Assert the compatibility invariant
+    // holds dynamically instead: minClientSchema <= CLIENT_SCHEMA_VERSION <= schemaVersion.
+    expect(typeof v.schemaVersion).toBe("number");
+    expect(typeof v.minClientSchema).toBe("number");
     expect(v.engineVersion).toMatch(/\d+\.\d+\.\d+/);
-    expect(v.minClientSchema).toBe(1);
+    expect(v.schemaVersion).toBeGreaterThanOrEqual(v.minClientSchema);
+    expect(v.minClientSchema).toBeLessThanOrEqual(CLIENT_SCHEMA_VERSION);
+    expect(CLIENT_SCHEMA_VERSION).toBeLessThanOrEqual(v.schemaVersion);
   });
 
   it("runs() lists the seeded run", async () => {
@@ -46,6 +53,9 @@ describe("EngineClient — typed read envelopes", () => {
     expect(s.seats.map((x) => x.seat).sort()).toEqual(["a", "b"]);
     expect(s.gate).toBeNull();
     expect(s.routing.mode).toBeTruthy();
+    // Schema 2 (additive): the run's working dir is reported; target is a string or null.
+    expect(typeof s.workingDir).toBe("string");
+    expect(s.target === null || typeof s.target === "string").toBe(true);
   });
 
   it("ledger() parses the rollup with zero spend", async () => {
@@ -61,6 +71,14 @@ describe("EngineClient — typed read envelopes", () => {
     expect(r.seats.sort()).toEqual(["a", "b"]);
     expect(Array.isArray(r.units)).toBe(true);
     expect(r.totalCost).toBe(0);
+    // Schema 2 (additive): report carries the same workingDir/target as run status.
+    expect(typeof r.workingDir).toBe("string");
+    expect(r.target === null || typeof r.target === "string").toBe(true);
+    // Each qaFinding (if any) carries structured file/line (string|null, number|null).
+    for (const f of r.qaFindings) {
+      expect(f.file === null || typeof f.file === "string").toBe(true);
+      expect(f.line === null || typeof f.line === "number").toBe(true);
+    }
   });
 
   it("gateShow() reports no pending gate", async () => {
@@ -108,5 +126,21 @@ describe("EngineClient — actions", () => {
     expect(res.ok).toBe(true);
     expect(res.phase).toBe("propose");
     expect(res.seats).toEqual(["a", "b"]);
+  });
+
+  it("runStop() terminally stops a run (schema 2)", async () => {
+    const res = await client.runStop(seed.runName);
+    expect(res.ok).toBe(true);
+    expect(res.run).toBe(seed.runName);
+    expect(res.status).toBe("stopped");
+    // Idempotent-ish: the run now reads back as stopped through the contract.
+    const s = await client.runStatus(seed.runName);
+    expect(s.status).toBe("stopped");
+  });
+
+  it("runStop() on an unknown run throws run_not_found", async () => {
+    await expect(client.runStop("does-not-exist")).rejects.toSatisfy(
+      (err: unknown) => err instanceof EngineError && err.code === "run_not_found"
+    );
   });
 });
