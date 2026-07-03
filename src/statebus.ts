@@ -18,10 +18,13 @@ import {
   emptyModel,
   modelFromReads,
   modelFromSnapshot,
+  tallyFromSnapshot,
   type RunModel,
-  type SnapshotState
+  type SnapshotState,
+  type TallyProjection
 } from "./viewmodels/model.js";
 import type { GateVM } from "./viewmodels/model.js";
+import type { CockpitEvent } from "./webview/protocol.js";
 
 export type MakeWatch = (run: string) => WatchClient;
 
@@ -29,6 +32,10 @@ export interface StateBusEvents {
   change: () => void;
   /** A newly-pending gate (fires once per gate id). */
   gate: (gate: GateVM, runRef: string) => void;
+  /** A live per-seat stream delta from the watch feed (forwarded for the cockpit). */
+  stream: (seat: string, line: string) => void;
+  /** A live append-only watch event (forwarded for the cockpit's activity/animation). */
+  event: (event: CockpitEvent) => void;
   log: (line: string) => void;
 }
 
@@ -40,6 +47,7 @@ export declare interface StateBus {
 export class StateBus extends EventEmitter {
   private runsList: RunSummary[] = [];
   private model: RunModel = emptyModel();
+  private lastTally: TallyProjection | null = null;
   private activeRun: string | null = null;
   private watch: WatchClient | null = null;
   private lastGateId: number | null = null;
@@ -57,6 +65,10 @@ export class StateBus extends EventEmitter {
   }
   get runModel(): RunModel {
     return this.model;
+  }
+  /** The most recent decide-phase tally (from the last snapshot), or null. */
+  get tally(): TallyProjection | null {
+    return this.lastTally;
   }
   get activeRunRef(): string | null {
     return this.activeRun;
@@ -90,18 +102,29 @@ export class StateBus extends EventEmitter {
     this.detachWatch();
     this.activeRun = runRef;
     this.model = emptyModel();
+    this.lastTally = null;
     this.lastGateId = null;
 
     const w = this.makeWatch(runRef);
     w.on("snapshot", (line) => {
-      this.model = modelFromSnapshot(line.state as SnapshotState);
+      const state = line.state as SnapshotState;
+      this.model = modelFromSnapshot(state);
+      this.lastTally = tallyFromSnapshot(state.tally);
       this.detectGate();
       this.emit("change");
     });
     w.on("event", (line) => {
       this.emit("log", `event ${line.event.type}`);
+      this.emit("event", {
+        type: line.event.type,
+        seat: line.event.seat ?? null,
+        itemId: line.event.itemId ?? null,
+        ts: line.event.ts,
+        payload: line.event.payload
+      });
       this.scheduleReadRefresh();
     });
+    w.on("stream", (line) => this.emit("stream", line.seat, line.line));
     w.on("reset", () => this.scheduleReadRefresh());
     w.on("error", (err) => this.emit("log", `watch error: ${err.message}`));
     w.start();

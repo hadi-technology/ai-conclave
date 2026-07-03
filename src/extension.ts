@@ -20,6 +20,7 @@ import { OrchestrateController } from "./orchestrate.js";
 import { presentGate } from "./gates.js";
 import { registerViews, type ViewData } from "./views.js";
 import { registerCommands, openReportForRun } from "./commands.js";
+import { CockpitPanel } from "./cockpit.js";
 import { emptyModel, type RunModel } from "./viewmodels/model.js";
 import { planBuildTarget } from "./viewmodels/startRun.js";
 import { prepareBuildTarget } from "./buildTarget.js";
@@ -252,6 +253,18 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   registerCommands(context, ctx);
+
+  // The live Cockpit webview (E3). Needs `context` for extensionUri + subscriptions,
+  // so it's registered here rather than in the vscode-free command module.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("conclave.openCockpit", () =>
+      CockpitPanel.createOrShow(context, ctx).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[conclave] cockpit failed: ${message}`);
+        void vscode.window.showErrorMessage(`Conclave: ${message}`);
+      })
+    )
+  );
 
   context.subscriptions.push({
     dispose: () => {

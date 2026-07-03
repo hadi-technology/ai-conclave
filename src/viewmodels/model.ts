@@ -169,6 +169,7 @@ export interface SnapshotState {
   seats?: Array<Record<string, unknown>>;
   units?: Array<Record<string, unknown>>;
   unitCounts?: Record<string, number>;
+  tally?: Record<string, unknown> | null;
   ledger?: Array<Record<string, unknown>>;
   perTier?: Array<Record<string, unknown>>;
   perPhase?: Array<Record<string, unknown>>;
@@ -296,6 +297,38 @@ export function gateFromSnapshot(
     critiqueCount,
     winners,
     budget: kind === "budget_exceeded" ? { budgetUsd, spent } : null
+  };
+}
+
+/** The decide-phase tally projection (from the cockpit snapshot's `TallyResult`).
+ *  Pure and defensive — returns null when no tally is present. */
+export interface TallyProjection {
+  totals: Array<{ label: string; seat: string; total: number }>;
+  winnerSeat: string | null;
+  winnerLabel: string | null;
+  margin: number;
+  escalate: boolean;
+  reason: string;
+}
+
+export function tallyFromSnapshot(
+  tally: Record<string, unknown> | null | undefined
+): TallyProjection | null {
+  if (!tally) return null;
+  const rawTotals = Array.isArray(tally.totals) ? (tally.totals as Array<Record<string, unknown>>) : [];
+  const totals = rawTotals.map((t) => ({
+    label: str(t.label) ?? "?",
+    seat: str(t.seat) ?? "?",
+    total: num(t.total)
+  }));
+  if (totals.length === 0 && tally.winnerSeat == null && tally.reason == null) return null;
+  return {
+    totals,
+    winnerSeat: str(tally.winnerSeat),
+    winnerLabel: str(tally.winnerLabel),
+    margin: num(tally.margin),
+    escalate: tally.escalate === true,
+    reason: str(tally.reason) ?? ""
   };
 }
 

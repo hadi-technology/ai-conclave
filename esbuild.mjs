@@ -6,8 +6,9 @@ import esbuild from "esbuild";
 const production = process.argv.includes("--production");
 const watch = process.argv.includes("--watch");
 
+/** The extension host bundle (Node, "vscode" external). */
 /** @type {import('esbuild').BuildOptions} */
-const options = {
+const extensionOptions = {
   entryPoints: ["src/extension.ts"],
   bundle: true,
   outfile: "dist/extension.js",
@@ -20,11 +21,27 @@ const options = {
   logLevel: "info"
 };
 
+/** The webview bundle (browser, no Node/vscode). Kept SEPARATE from the
+ *  extension bundle and loaded in the sandboxed webview via a nonce'd script. */
+/** @type {import('esbuild').BuildOptions} */
+const webviewOptions = {
+  entryPoints: ["src/webview/app.ts"],
+  bundle: true,
+  outfile: "dist/webview/app.js",
+  platform: "browser",
+  format: "iife",
+  target: "es2020",
+  sourcemap: !production,
+  minify: production,
+  logLevel: "info"
+};
+
 if (watch) {
-  const ctx = await esbuild.context(options);
-  await ctx.watch();
-  console.log("[esbuild] watching…");
+  const ext = await esbuild.context(extensionOptions);
+  const web = await esbuild.context(webviewOptions);
+  await Promise.all([ext.watch(), web.watch()]);
+  console.log("[esbuild] watching (extension + webview)…");
 } else {
-  await esbuild.build(options);
-  console.log("[esbuild] build complete");
+  await Promise.all([esbuild.build(extensionOptions), esbuild.build(webviewOptions)]);
+  console.log("[esbuild] build complete (extension + webview)");
 }

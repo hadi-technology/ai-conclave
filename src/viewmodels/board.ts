@@ -45,6 +45,7 @@ export function unitColumn(status: string): BoardColumn {
       return "Done";
     case "blocked":
     case "failed":
+    case "excused":
       return "Blocked";
     default:
       return "Queued";

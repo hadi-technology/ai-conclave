@@ -1,0 +1,492 @@
+/*
+ * Conclave Cockpit — theme-aware styling. Everything derives from VS Code webview
+ * CSS variables (var(--vscode-*)) so it matches the active light / dark /
+ * high-contrast theme natively. The ONE accent that is NOT themed is the per-seat
+ * vendor colour chip (set inline from vendorColors.ts).
+ */
+:root {
+  --gap: 10px;
+  --radius: 6px;
+  --card-bg: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  --border: var(--vscode-widget-border, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.3)));
+  --muted: var(--vscode-descriptionForeground, #999);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  overflow: hidden;
+}
+
+.cockpit {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Top lane ──────────────────────────────────────────────────────────────── */
+
+.top-lane {
+  padding: var(--gap) 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.run-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.run-name {
+  font-weight: 600;
+  font-size: 1.05em;
+}
+.run-status {
+  color: var(--muted);
+}
+.badge-watch {
+  font-size: 0.78em;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+
+.phases {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.phase-step {
+  font-size: 0.78em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.phase-step.phase-done {
+  color: var(--vscode-foreground);
+  border-color: var(--vscode-charts-green, #3aa675);
+}
+.phase-step.phase-current {
+  background: var(--vscode-progressBar-background, var(--vscode-button-background));
+  color: var(--vscode-button-foreground, #fff);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.lane-row {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.cost {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cost-total {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cost-num {
+  font-size: 1.2em;
+  font-weight: 700;
+}
+.cost-sub {
+  color: var(--muted);
+  font-size: 0.82em;
+}
+.cost-seats {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cost-seat-amt {
+  font-variant-numeric: tabular-nums;
+}
+.cost-est {
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.tally {
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tally-title {
+  font-size: 0.82em;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tally-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tally-bar {
+  flex: 1;
+  height: 8px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.tally-fill {
+  height: 100%;
+  background: var(--muted);
+  transition: width 300ms ease;
+}
+.tally-fill.tally-winner {
+  background: var(--vscode-charts-green, #3aa675);
+}
+.tally-num {
+  font-variant-numeric: tabular-nums;
+  min-width: 22px;
+  text-align: right;
+}
+.tally-reason {
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 14px 0;
+  flex: 0 0 auto;
+}
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: var(--muted);
+  padding: 6px 14px;
+  cursor: pointer;
+  border-radius: var(--radius) var(--radius) 0 0;
+  font-size: 0.92em;
+}
+.tab-active {
+  color: var(--vscode-foreground);
+  background: var(--card-bg);
+  border-color: var(--border);
+}
+
+/* ── View / board ──────────────────────────────────────────────────────────── */
+
+.view {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 12px 14px;
+  min-height: 0;
+}
+.board-empty,
+.streams-empty {
+  color: var(--muted);
+  padding: 24px;
+  text-align: center;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: var(--gap);
+  align-items: start;
+}
+.column {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 80px;
+}
+.column-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+}
+.column-name {
+  font-weight: 600;
+  font-size: 0.85em;
+}
+.column-count {
+  font-size: 0.78em;
+  color: var(--muted);
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  border-radius: 9px;
+  padding: 0 7px;
+}
+.column[data-col="Blocked"] .column-name {
+  color: var(--vscode-errorForeground, #e35);
+}
+.column-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+.column-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 6px;
+  opacity: 0.5;
+}
+
+.card {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 5px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  will-change: transform;
+}
+.card[data-status="blocked"],
+.card[data-status="failed"] {
+  border-left-color: var(--vscode-errorForeground, #e35);
+}
+.card[data-status="excused"] {
+  border-left-color: var(--vscode-charts-yellow, #d0a215);
+}
+/* Reverted / rework: stays in Building but must read as "reverted" at a glance —
+   a warning-toned left border + dashed edge, distinct from clean in-progress and
+   from a terminal Blocked card. */
+.card[data-status="qa_fail"],
+.card[data-status="fixed"] {
+  border-left-color: var(--vscode-editorWarning-foreground, #d0a215);
+  border-left-style: dashed;
+}
+.rework-tag {
+  border-color: var(--vscode-editorWarning-foreground, #d0a215);
+  color: var(--vscode-editorWarning-foreground, #d0a215);
+  font-weight: 600;
+}
+.card-enter {
+  animation: cardIn 260ms ease;
+}
+@keyframes cardIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.card-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.card-seq {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85em;
+}
+.card-title {
+  font-weight: 600;
+  font-size: 0.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-meta {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.card-qa {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  font-size: 0.8em;
+  color: var(--muted);
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+}
+.qa-label {
+  font-weight: 700;
+  color: var(--vscode-charts-blue, #4a9);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 0.78em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chip-muted {
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.tag {
+  font-size: 0.74em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.phase-tag {
+  text-transform: lowercase;
+}
+
+/* ── Gate ──────────────────────────────────────────────────────────────────── */
+
+.gate {
+  margin: 10px 14px 0;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--vscode-inputValidation-infoBackground, var(--card-bg));
+  border-left: 3px solid var(--vscode-charts-blue, #4a9);
+}
+.gate-warning {
+  background: var(--vscode-inputValidation-warningBackground, var(--card-bg));
+  border-left-color: var(--vscode-editorWarning-foreground, #d0a215);
+}
+.gate-readonly {
+  opacity: 0.85;
+}
+.gate-msg {
+  font-weight: 600;
+}
+.gate-detail {
+  color: var(--muted);
+  font-size: 0.88em;
+  margin-top: 3px;
+}
+.gate-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  align-items: flex-start;
+}
+.gate-action {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gate-input {
+  display: flex;
+  gap: 4px;
+}
+.gate-input input {
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+.gate-note {
+  margin-top: 6px;
+  font-size: 0.82em;
+  color: var(--muted);
+}
+
+.btn {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  border-radius: 4px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+.btn:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-danger {
+  background: var(--vscode-inputValidation-errorBackground, #a33);
+  color: var(--vscode-foreground);
+}
+.btn-sm {
+  padding: 3px 8px;
+  font-size: 0.82em;
+}
+
+/* ── Streams ───────────────────────────────────────────────────────────────── */
+
+.streams {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.stream-pane {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.stream-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 10px;
+  background: var(--card-bg);
+  border-bottom: 1px solid var(--border);
+}
+.stream-seat {
+  font-weight: 600;
+}
+.stream-dropped {
+  font-size: 0.76em;
+  color: var(--muted);
+}
+.stream-body {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 12px);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card,
+  .card-enter,
+  .tally-fill {
+    animation: none !important;
+    transition: none !important;
+  }
+}

@@ -69,10 +69,16 @@
     "viewsWelcome": [
       {
         "view": "conclave.runsView",
-        "contents": "Conclave convenes a multi-model AI fleet inside your editor.\n\nStart a run and drive it from here — the Runs, Seats, Board, and Ledger views update live, and gates surface as notifications. The streaming cockpit arrives in a later milestone.\n\n[Start a run](command:conclave.startRun)\n[Attach to a run (watch-only)](command:conclave.attachRun)\n\nConclave needs the wrk2gthr engine and Node 25+. Configure them in [Settings](command:workbench.action.openSettings?%22conclave%22)."
+        "contents": "Conclave convenes a multi-model AI fleet inside your editor.\n\nStart a run and drive it from here — the Runs, Seats, Board, and Ledger views update live, and gates surface as notifications. Open the live Cockpit for the Kanban board, streaming panes, votes, and cost.\n\n[Open Cockpit](command:conclave.openCockpit)\n[Start a run](command:conclave.startRun)\n[Attach to a run (watch-only)](command:conclave.attachRun)\n\nConclave needs the wrk2gthr engine and Node 25+. Configure them in [Settings](command:workbench.action.openSettings?%22conclave%22)."
       }
     ],
     "commands": [
+      {
+        "command": "conclave.openCockpit",
+        "title": "Open Cockpit",
+        "category": "Conclave",
+        "icon": "$(dashboard)"
+      },
       {
         "command": "conclave.startRun",
         "title": "Start run",
@@ -138,6 +144,11 @@
           "command": "conclave.startRun",
           "when": "view == conclave.runsView",
           "group": "navigation@1"
+        },
+        {
+          "command": "conclave.openCockpit",
+          "when": "view == conclave.boardView || view == conclave.runsView",
+          "group": "navigation@0"
         },
         {
           "command": "conclave.refresh",
