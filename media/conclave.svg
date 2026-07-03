@@ -1,0 +1,12 @@
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <!-- Conclave: a ring of peers convened around a center. Monochrome, themes via currentColor. -->
+  <g fill="currentColor">
+    <circle cx="12" cy="4" r="2"/>
+    <circle cx="19.07" cy="7.5" r="1.7"/>
+    <circle cx="19.07" cy="16.5" r="1.7"/>
+    <circle cx="12" cy="20" r="2"/>
+    <circle cx="4.93" cy="16.5" r="1.7"/>
+    <circle cx="4.93" cy="7.5" r="1.7"/>
+    <circle cx="12" cy="12" r="2.6"/>
+  </g>
+</svg>

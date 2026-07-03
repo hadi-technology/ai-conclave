@@ -1,0 +1,182 @@
+{
+  "name": "conclave",
+  "displayName": "Conclave",
+  "description": "Convene a multi-model AI fleet inside VS Code and Cursor — drive propose → decide → plan → build → cross-check → validate runs from your editor. A thin client for the wrk2gthr engine.",
+  "version": "0.0.1",
+  "publisher": "hadi-technology",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hadi-technology/ai-conclave.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "keywords": [
+    "ai",
+    "agents",
+    "multi-model",
+    "orchestration",
+    "conclave",
+    "wrk2gthr"
+  ],
+  "icon": "media/icon.png",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:conclave.runsView"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "conclave",
+          "title": "Conclave",
+          "icon": "media/conclave.svg"
+        }
+      ]
+    },
+    "views": {
+      "conclave": [
+        {
+          "id": "conclave.runsView",
+          "name": "Runs",
+          "contextualTitle": "Conclave"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "conclave.runsView",
+        "contents": "Conclave convenes a multi-model AI fleet inside your editor.\n\nThe rich sidebar and live cockpit arrive in later milestones. For now, drive the engine from the Command Palette.\n\n[Start a run](command:conclave.startRun)\n[Show status](command:conclave.showStatus)\n[Attach to a run (watch-only)](command:conclave.attachRun)\n\nConclave needs the wrk2gthr engine and Node 25+. Configure them in [Settings](command:workbench.action.openSettings?%22conclave%22)."
+      }
+    ],
+    "commands": [
+      {
+        "command": "conclave.startRun",
+        "title": "Start run",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.showStatus",
+        "title": "Show status",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.openReport",
+        "title": "Open report",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.showLedger",
+        "title": "Show ledger",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.approveGate",
+        "title": "Approve gate",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.stopRun",
+        "title": "Stop run",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.attachRun",
+        "title": "Attach to run (watch-only)",
+        "category": "Conclave"
+      }
+    ],
+    "configuration": {
+      "title": "Conclave",
+      "properties": {
+        "conclave.enginePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the wrk2gthr engine entrypoint (`bin/collab.mjs`). Leave blank to auto-detect a local checkout.",
+          "scope": "machine-overridable"
+        },
+        "conclave.nodePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a Node.js **25 or newer** binary used to run the engine (the engine imports TypeScript directly and requires Node ≥25). Leave blank to auto-detect.",
+          "scope": "machine-overridable"
+        },
+        "conclave.adaptersDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Directory of `<seat>.json` vendor adapters. Leave blank to use the engine's default (`./adapters`).",
+          "scope": "machine-overridable"
+        },
+        "conclave.defaultSeats": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default comma-separated seat list for new runs, e.g. `claude,glm,codex`.",
+          "scope": "window"
+        },
+        "conclave.defaultDomain": {
+          "type": "string",
+          "enum": [
+            "coding",
+            "writing",
+            "research"
+          ],
+          "default": "coding",
+          "markdownDescription": "Default job domain for new runs (selects the verifier).",
+          "scope": "window"
+        },
+        "conclave.defaultApproval": {
+          "type": "string",
+          "enum": [
+            "plan-only",
+            "plan+risky-deliver",
+            "final"
+          ],
+          "default": "plan-only",
+          "markdownDescription": "Default approval policy for new runs.",
+          "scope": "window"
+        },
+        "conclave.defaultBudget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Default spend ceiling (USD) for new runs. Leave blank for no ceiling.",
+          "scope": "window"
+        },
+        "conclave.defaultRouting": {
+          "type": "string",
+          "enum": [
+            "usage-aware",
+            "efficiency",
+            "auto"
+          ],
+          "default": "auto",
+          "markdownDescription": "Default routing mode for new runs (spare near-capped subscriptions vs quota-blind speed).",
+          "scope": "window"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "package": "node esbuild.mjs --production && vsce package --no-dependencies -o conclave.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
