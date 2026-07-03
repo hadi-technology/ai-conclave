@@ -27,7 +27,10 @@
   "icon": "media/icon.png",
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onView:conclave.runsView"
+    "onView:conclave.runsView",
+    "onView:conclave.seatsView",
+    "onView:conclave.boardView",
+    "onView:conclave.ledgerView"
   ],
   "contributes": {
     "viewsContainers": {
@@ -45,20 +48,36 @@
           "id": "conclave.runsView",
           "name": "Runs",
           "contextualTitle": "Conclave"
+        },
+        {
+          "id": "conclave.seatsView",
+          "name": "Seats",
+          "contextualTitle": "Conclave"
+        },
+        {
+          "id": "conclave.boardView",
+          "name": "Board",
+          "contextualTitle": "Conclave"
+        },
+        {
+          "id": "conclave.ledgerView",
+          "name": "Ledger",
+          "contextualTitle": "Conclave"
         }
       ]
     },
     "viewsWelcome": [
       {
         "view": "conclave.runsView",
-        "contents": "Conclave convenes a multi-model AI fleet inside your editor.\n\nThe rich sidebar and live cockpit arrive in later milestones. For now, drive the engine from the Command Palette.\n\n[Start a run](command:conclave.startRun)\n[Show status](command:conclave.showStatus)\n[Attach to a run (watch-only)](command:conclave.attachRun)\n\nConclave needs the wrk2gthr engine and Node 25+. Configure them in [Settings](command:workbench.action.openSettings?%22conclave%22)."
+        "contents": "Conclave convenes a multi-model AI fleet inside your editor.\n\nStart a run and drive it from here — the Runs, Seats, Board, and Ledger views update live, and gates surface as notifications. The streaming cockpit arrives in a later milestone.\n\n[Start a run](command:conclave.startRun)\n[Attach to a run (watch-only)](command:conclave.attachRun)\n\nConclave needs the wrk2gthr engine and Node 25+. Configure them in [Settings](command:workbench.action.openSettings?%22conclave%22)."
       }
     ],
     "commands": [
       {
         "command": "conclave.startRun",
         "title": "Start run",
-        "category": "Conclave"
+        "category": "Conclave",
+        "icon": "$(add)"
       },
       {
         "command": "conclave.showStatus",
@@ -77,20 +96,83 @@
       },
       {
         "command": "conclave.approveGate",
-        "title": "Approve gate",
+        "title": "Resolve gate",
         "category": "Conclave"
       },
       {
         "command": "conclave.stopRun",
-        "title": "Stop run",
+        "title": "Stop watching run",
         "category": "Conclave"
       },
       {
         "command": "conclave.attachRun",
         "title": "Attach to run (watch-only)",
         "category": "Conclave"
+      },
+      {
+        "command": "conclave.openRun",
+        "title": "Open run",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.focusRun",
+        "title": "Focus run",
+        "category": "Conclave"
+      },
+      {
+        "command": "conclave.driveRun",
+        "title": "Drive run (orchestrate)",
+        "category": "Conclave",
+        "icon": "$(play)"
+      },
+      {
+        "command": "conclave.refresh",
+        "title": "Refresh",
+        "category": "Conclave",
+        "icon": "$(refresh)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "conclave.startRun",
+          "when": "view == conclave.runsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "conclave.refresh",
+          "when": "view == conclave.runsView || view == conclave.seatsView || view == conclave.boardView || view == conclave.ledgerView",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "conclave.driveRun",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "inline@1"
+        },
+        {
+          "command": "conclave.stopRun",
+          "when": "view == conclave.runsView && viewItem == conclaveRunActive",
+          "group": "inline@2"
+        },
+        {
+          "command": "conclave.openReport",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "conclave@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "conclave.openRun",
+          "when": "false"
+        },
+        {
+          "command": "conclave.focusRun",
+          "when": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "Conclave",
       "properties": {
@@ -110,6 +192,12 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Directory of `<seat>.json` vendor adapters. Leave blank to use the engine's default (`./adapters`).",
+          "scope": "machine-overridable"
+        },
+        "conclave.targetDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Directory the fleet **builds in** when driving a run with execution (the engine's `--target`). The fleet creates git worktrees, branches, and commits here. **Leave blank (recommended)** to build in a per-run isolated scratch clone of your workspace under the OS temp dir — your working tree is never touched. Point this at a path only if you want a fixed build location. Pointing it at your live repo root is allowed but the fleet will then write worktrees/branches/commits into your actual repo (you will be warned at preflight).",
           "scope": "machine-overridable"
         },
         "conclave.defaultSeats": {

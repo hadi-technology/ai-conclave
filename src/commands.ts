@@ -1,9 +1,9 @@
 /**
- * E1 core commands — thin wrappers over the engine client. Each resolves a
- * client (which provisions Node ≥25 + engine + schema check), calls a `--json`
- * command or the watch feed, and renders real data or a clear, actionable error.
- * Rich UI (trees, cockpit webview, gate notifications) is E2/E3; here we use the
- * Output channel, info/error messages, and simple input flows.
+ * Commands — thin wrappers over the engine client and the E2 UX modules. Each
+ * resolves a client (which provisions Node ≥25 + engine + schema check), then
+ * drives a `--json` command, the watch feed, the guided start-run flow, or the
+ * gate UX. Rich rendering lives in the tree views + status bar (src/views.ts);
+ * these handlers cover start/drive/stop, reports, and manual gate resolution.
  */
 import * as vscode from "vscode";
 
@@ -12,28 +12,25 @@ import { EngineError } from "./engine/errors.js";
 import type { EngineClient } from "./engine/client.js";
 import type { RunSummary } from "./engine/contract.js";
 import { WatchClient } from "./engine/watch.js";
+import { runStartFlow } from "./startRunFlow.js";
+import { presentGate } from "./gates.js";
+import { gateFromRead } from "./viewmodels/model.js";
 
 export function registerCommands(context: vscode.ExtensionContext, ctx: ConclaveContext): void {
-  const reg = (id: string, fn: () => Promise<void>) =>
-    context.subscriptions.push(
-      vscode.commands.registerCommand(id, () => guarded(ctx, fn))
-    );
+  const reg = (id: string, fn: (arg?: unknown) => Promise<void>) =>
+    context.subscriptions.push(vscode.commands.registerCommand(id, (arg?: unknown) => guarded(ctx, () => fn(arg))));
 
   reg("conclave.startRun", () => startRun(ctx));
   reg("conclave.showStatus", () => showStatus(ctx));
   reg("conclave.openReport", () => openReport(ctx));
   reg("conclave.showLedger", () => showLedger(ctx));
-  reg("conclave.approveGate", () => approveGate(ctx));
-  reg("conclave.stopRun", () => stopRun(ctx));
+  reg("conclave.approveGate", () => resolveGate(ctx));
+  reg("conclave.stopRun", (arg) => stopRun(ctx, arg));
   reg("conclave.attachRun", () => attachRun(ctx));
-
-  // Detach any live watchers on unload.
-  context.subscriptions.push({
-    dispose: () => {
-      for (const w of ctx.watchers.values()) w.stop();
-      ctx.watchers.clear();
-    }
-  });
+  reg("conclave.openRun", (arg) => openRun(ctx, arg));
+  reg("conclave.focusRun", () => focusRun(ctx));
+  reg("conclave.driveRun", (arg) => driveRunCmd(ctx, arg));
+  reg("conclave.refresh", () => refresh(ctx));
 }
 
 /** Wrap a handler: turn EngineError into a friendly message + hint. */
@@ -41,9 +38,7 @@ async function guarded(ctx: ConclaveContext, fn: () => Promise<void>): Promise<v
   try {
     await fn();
   } catch (err) {
-    if (err instanceof CancelledError) {
-      return; // user dismissed a picker — not an error
-    }
+    if (err instanceof CancelledError) return;
     if (err instanceof EngineError) {
       ctx.output.appendLine(`[conclave] error ${err.code}: ${err.toDisplay()}`);
       vscode.window.showErrorMessage(`Conclave: ${err.toDisplay()}`);
@@ -57,18 +52,10 @@ async function guarded(ctx: ConclaveContext, fn: () => Promise<void>): Promise<v
 
 // ── run selection ──────────────────────────────────────────────────────────
 
-/**
- * Pick a run: 0 → error, 1 → that one, many → Quick Pick (active first).
- * Returns the run name (the engine accepts name or id).
- */
 async function pickRun(client: EngineClient, placeholder: string): Promise<string> {
   const { runs } = await client.runs();
   if (runs.length === 0) {
-    throw new EngineError(
-      "no_runs",
-      "There are no runs in this workspace yet",
-      "Start one with 'Conclave: Start run'."
-    );
+    throw new EngineError("no_runs", "There are no runs in this workspace yet", "Start one with 'Conclave: Start run'.");
   }
   if (runs.length === 1) return runs[0].name;
 
@@ -86,6 +73,15 @@ async function pickRun(client: EngineClient, placeholder: string): Promise<strin
   return (pick.run as RunSummary).name;
 }
 
+/** Coerce a command argument (tree node runRef, or undefined) into a run ref. */
+function argRunRef(arg: unknown): string | undefined {
+  if (typeof arg === "string") return arg;
+  if (arg && typeof arg === "object" && typeof (arg as { runRef?: unknown }).runRef === "string") {
+    return (arg as { runRef: string }).runRef;
+  }
+  return undefined;
+}
+
 class CancelledError extends Error {
   constructor() {
     super("cancelled");
@@ -98,61 +94,53 @@ class CancelledError extends Error {
 async function startRun(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
   const cfg = vscode.workspace.getConfiguration("conclave");
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 
-  const problem = await vscode.window.showInputBox({
-    title: "Conclave: Start run",
-    prompt: "What is the problem to solve? (the run goal)",
-    ignoreFocusOut: true,
-    validateInput: (v) => (v.trim() ? null : "A goal is required.")
-  });
-  if (problem === undefined) return; // cancelled
+  const started = await runStartFlow(client, cfg, cwd);
+  if (!started) return; // cancelled at some step / preflight declined
 
-  const criteria = await vscode.window.showInputBox({
-    title: "Conclave: Start run — acceptance criteria",
-    prompt: "How is 'done' judged? (acceptance criteria — optional)",
-    ignoreFocusOut: true
-  });
-  if (criteria === undefined) return;
-
-  const seats = await vscode.window.showInputBox({
-    title: "Conclave: Start run — seats",
-    prompt: "Comma-separated seats, e.g. claude,glm,codex",
-    value: cfg.get<string>("defaultSeats", ""),
-    ignoreFocusOut: true,
-    validateInput: (v) => (v.trim() ? null : "At least one seat is required.")
-  });
-  if (seats === undefined) return;
-
-  const budgetSetting = cfg.get<number | null>("defaultBudget", null);
-
-  const result = await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: "Conclave: starting run…" },
-    () =>
-      client.runStart({
-        problem: problem.trim(),
-        criteria: criteria.trim() || undefined,
-        seats: seats.trim(),
-        domain: cfg.get<string>("defaultDomain", "coding"),
-        approval: cfg.get<string>("defaultApproval", "plan-only"),
-        routing: cfg.get<string>("defaultRouting", "auto"),
-        budgetUsd: typeof budgetSetting === "number" ? budgetSetting : null
-      })
-  );
-
-  ctx.output.appendLine(
-    `[conclave] started run "${result.run}" (#${result.id}) — phase ${result.phase}, seats ${result.seats.join(", ")}.`
-  );
+  ctx.output.appendLine(`[conclave] started run "${started.run}" (#${started.id}), seats ${started.inputs.seats}.`);
   ctx.output.show(true);
+
+  // Actually DRIVE it: focus the run in the views + spawn the orchestrate child,
+  // building in the already-prepared isolated target (never the workspace root).
+  await ctx.focusRun(started.run);
+  await ctx.driveRun(started.run, { fullAuto: started.inputs.fullAuto, target: started.buildTarget });
+
   vscode.window.showInformationMessage(
-    `Conclave: started run "${result.run}" (#${result.id}) in phase ${result.phase}.`
+    `Conclave: started + driving "${started.run}" (#${started.id}). Watch the sidebar; gates surface as notifications.`
   );
+}
+
+async function driveRunCmd(ctx: ConclaveContext, arg: unknown): Promise<void> {
+  const client = await ctx.resolveClient();
+  const run = argRunRef(arg) ?? (await pickRun(client, "Drive which run?"));
+  await ctx.focusRun(run);
+  await ctx.driveRun(run);
+  vscode.window.showInformationMessage(`Conclave: driving "${run}".`);
+}
+
+async function openRun(ctx: ConclaveContext, arg: unknown): Promise<void> {
+  const run = argRunRef(arg);
+  if (!run) return;
+  await ctx.focusRun(run);
+}
+
+async function focusRun(ctx: ConclaveContext): Promise<void> {
+  const bus = await ctx.ensureBus();
+  await vscode.commands.executeCommand("conclave.runsView.focus");
+  if (bus.activeRunRef) ctx.output.appendLine(`[conclave] focused run "${bus.activeRunRef}".`);
+}
+
+async function refresh(ctx: ConclaveContext): Promise<void> {
+  const bus = await ctx.ensureBus();
+  await bus.refreshRuns();
 }
 
 async function showStatus(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
   const run = await pickRun(client, "Show status for which run?");
   const s = await client.runStatus(run);
-
   const lines: string[] = [];
   lines.push(`Run: ${s.run} (#${s.id})`);
   lines.push(`Phase: ${s.phase}   Status: ${s.status}`);
@@ -161,29 +149,27 @@ async function showStatus(ctx: ConclaveContext): Promise<void> {
   lines.push(`Routing: ${s.routing.mode} (effective: ${s.routing.effective})`);
   lines.push("Seats:");
   for (const seat of s.seats) {
-    lines.push(
-      `  · ${seat.seat}: ${seat.status}, headroom ${seat.headroom}${seat.capped ? " (capped)" : ""}`
-    );
+    lines.push(`  · ${seat.seat}: ${seat.status}, headroom ${seat.headroom}${seat.capped ? " (capped)" : ""}`);
   }
   lines.push(s.gate ? `Gate: #${s.gate.id} ${s.gate.kind} (${s.gate.status})` : "Gate: none pending");
-
   writeBlock(ctx, `Status — ${s.run}`, lines);
-  vscode.window.showInformationMessage(
-    `Conclave: ${s.run} — ${s.phase}/${s.status}${s.gate ? `, gate ${s.gate.kind} pending` : ""}.`
-  );
 }
 
 async function openReport(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
   const run = await pickRun(client, "Open report for which run?");
-  const r = await client.report(run);
+  await openReportForRun(ctx, run);
+}
 
+/** Open a run's structured report as a Markdown document. Reused by the gate UX. */
+export async function openReportForRun(ctx: ConclaveContext, run: string): Promise<void> {
+  const client = await ctx.resolveClient();
+  const r = await client.report(run);
   const md: string[] = [];
   md.push(`# Conclave report — ${r.run} (#${r.id})`, "");
   md.push(`**Problem:** ${r.problem}`, "");
   md.push(`**Phase:** ${r.phase}  ·  **Status:** ${r.status}  ·  **Seats:** ${r.seats.join(", ")}`, "");
   md.push(`**Total cost:** $${r.totalCost.toFixed(4)}`, "");
-
   md.push("## Units", "");
   if (r.units.length === 0) {
     md.push("_No work units yet._", "");
@@ -191,13 +177,10 @@ async function openReport(ctx: ConclaveContext): Promise<void> {
     md.push("| # | Title | Tier | Author | Reviewer | Status | QA | Commit |");
     md.push("|---|-------|------|--------|----------|--------|----|--------|");
     for (const u of r.units) {
-      md.push(
-        `| ${u.seq} | ${u.title} | ${u.tier} | ${u.author} | ${u.reviewer} | ${u.status} | ${u.qa} | ${u.commit ?? "—"} |`
-      );
+      md.push(`| ${u.seq} | ${u.title} | ${u.tier} | ${u.author} | ${u.reviewer} | ${u.status} | ${u.qa} | ${u.commit ?? "—"} |`);
     }
     md.push("");
   }
-
   md.push("## QA findings", "");
   if (r.qaFindings.length === 0) {
     md.push("_None._", "");
@@ -207,7 +190,6 @@ async function openReport(ctx: ConclaveContext): Promise<void> {
     }
     md.push("");
   }
-
   const doc = await vscode.workspace.openTextDocument({ language: "markdown", content: md.join("\n") });
   await vscode.window.showTextDocument(doc, { preview: false });
   ctx.output.appendLine(`[conclave] opened report for "${r.run}" (#${r.id}).`);
@@ -217,12 +199,9 @@ async function showLedger(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
   const run = await pickRun(client, "Show ledger for which run?");
   const l = await client.ledger(run);
-
   const lines: string[] = [];
   lines.push(`Ledger — ${l.run} (#${l.id})`);
-  lines.push(
-    `Total: $${l.total.toFixed(4)}  (exact $${l.exact.toFixed(4)}, estimated $${l.estimated.toFixed(4)})`
-  );
+  lines.push(`Total: $${l.total.toFixed(4)}  (exact $${l.exact.toFixed(4)}, estimated $${l.estimated.toFixed(4)})`);
   if (l.budgetUsd != null) {
     const frac = l.fracUsed != null ? ` (${Math.round(l.fracUsed * 100)}% used)` : "";
     lines.push(`Budget: $${l.budgetUsd.toFixed(2)}${frac}`);
@@ -238,70 +217,40 @@ async function showLedger(ctx: ConclaveContext): Promise<void> {
     }
   }
   writeBlock(ctx, `Ledger — ${l.run}`, lines);
-  vscode.window.showInformationMessage(`Conclave: ${l.run} total spend $${l.total.toFixed(4)}.`);
 }
 
-async function approveGate(ctx: ConclaveContext): Promise<void> {
+/** Manual gate resolution (also raised automatically by the bus on a pending gate). */
+async function resolveGate(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
-  const run = await pickRun(client, "Approve the gate on which run?");
-  const g = await client.gateShow(run);
-
-  if (!g.gate) {
+  const run = await pickRun(client, "Resolve the gate on which run?");
+  const [gateShow, budget] = await Promise.all([client.gateShow(run), client.budgetShow(run).catch(() => null)]);
+  const gate = gateFromRead(gateShow, budget);
+  if (!gate) {
     vscode.window.showInformationMessage(`Conclave: no gate is pending on "${run}".`);
     return;
   }
-
-  let winner: string | undefined;
-  if (g.gate.kind === "decide_tie") {
-    // tie gates require a winner seat.
-    const options = (g.gate.options ?? [])
-      .map((o) => (typeof o === "object" && o !== null ? (o as { winner?: string }).winner : undefined))
-      .filter((w): w is string => !!w);
-    const proposalSeats = options.length ? options : g.gate.plan ? [g.gate.plan.seat] : [];
-    winner = await vscode.window.showQuickPick(proposalSeats, {
-      placeHolder: "Pick the winning seat for this tie gate"
-    });
-    if (!winner) return; // cancelled
-  }
-
-  const feedback = await vscode.window.showInputBox({
-    title: `Approve gate #${g.gate.id} (${g.gate.kind})`,
-    prompt: "Optional feedback for approval (leave blank for none)",
-    ignoreFocusOut: true
+  await presentGate(gate, {
+    client,
+    runRef: run,
+    log: (l) => ctx.output.appendLine(`[gate] ${l}`),
+    openReport: (r) => openReportForRun(ctx, r),
+    stop: (r) => ctx.stopRun(r)
   });
-  if (feedback === undefined) return; // cancelled
-
-  const res = await client.gateApprove({
-    run,
-    winner,
-    feedback: feedback.trim() || undefined
-  });
-  ctx.output.appendLine(
-    `[conclave] gate #${res.gate} ${res.kind} → ${res.resolution}${res.winner ? ` (winner ${res.winner})` : ""}.`
-  );
-  vscode.window.showInformationMessage(`Conclave: gate #${res.gate} ${res.resolution}.`);
 }
 
-async function stopRun(ctx: ConclaveContext): Promise<void> {
-  // The engine's JSON contract exposes no run cancel/stop command yet, so
-  // "Stop run" detaches the extension's own live watch attachments (the thing
-  // the thin client actually owns). Engine-side hard-cancel awaits a contract
-  // command — surfaced clearly rather than faked.
+async function stopRun(ctx: ConclaveContext, arg: unknown): Promise<void> {
   const client = await ctx.resolveClient();
-  const run = await pickRun(client, "Stop watching which run?");
-
-  const w = ctx.watchers.get(run);
-  if (w) {
-    w.stop();
-    ctx.watchers.delete(run);
-    ctx.output.appendLine(`[conclave] detached live watch for "${run}".`);
-    vscode.window.showInformationMessage(`Conclave: detached the live feed for "${run}".`);
-    return;
+  const run = argRunRef(arg) ?? (await pickRun(client, "Stop watching which run?"));
+  const driving = ctx.orchestrators.has(run);
+  const watching = ctx.watchers.has(run);
+  ctx.stopRun(run);
+  if (driving || watching) {
+    vscode.window.showInformationMessage(`Conclave: stopped "${run}" (${driving ? "orchestrate + " : ""}watch detached).`);
+  } else {
+    vscode.window.showWarningMessage(
+      `Conclave: nothing local to stop for "${run}". Engine-side run cancellation is not yet in the JSON contract.`
+    );
   }
-
-  vscode.window.showWarningMessage(
-    `Conclave: no live feed attached for "${run}". Engine-side run cancellation is not yet in the JSON contract — nothing to stop.`
-  );
 }
 
 async function attachRun(ctx: ConclaveContext): Promise<void> {
@@ -310,57 +259,22 @@ async function attachRun(ctx: ConclaveContext): Promise<void> {
 
   if (ctx.watchers.has(run)) {
     vscode.window.showInformationMessage(`Conclave: already attached to "${run}".`);
-    ctx.output.show(true);
     return;
   }
-
-  const prov = await ctx.ensureProvisioned();
-  const cfg = vscode.workspace.getConfiguration("conclave");
-  const adaptersDir = cfg.get<string>("adaptersDir", "").trim();
-  const cwd = vscode.workspace.workspaceFolders![0].uri.fsPath;
-
-  const watcher = new WatchClient(
-    {
-      nodePath: prov.nodePath,
-      enginePath: prov.enginePath,
-      cwd,
-      adaptersDir: adaptersDir || undefined
-    },
-    { run }
-  );
-
-  watcher.on("snapshot", (line) => {
-    const state = line.state as { phase?: string; status?: string };
-    ctx.output.appendLine(
-      `[watch ${run}] snapshot @cursor ${line.cursor} — phase ${state.phase ?? "?"}, status ${state.status ?? "?"}`
-    );
-  });
-  watcher.on("event", (line) => {
-    ctx.output.appendLine(`[watch ${run}] event @${line.cursor} ${line.event.type}`);
-  });
-  watcher.on("stream", (line) => {
-    ctx.output.appendLine(`[watch ${run}] ${line.seat}> ${line.line}`);
-  });
-  watcher.on("reset", (line) => {
-    ctx.output.appendLine(`[watch ${run}] reset — ${line.reason} (re-snapshotting)`);
-  });
-  watcher.on("reconnecting", (info) => {
-    ctx.output.appendLine(`[watch ${run}] reconnecting (attempt ${info.attempt}, since ${info.since ?? "head"})`);
-  });
-  watcher.on("error", (err) => {
-    ctx.output.appendLine(`[watch ${run}] error: ${err.message}`);
-  });
+  const clientConfig = await ctx.resolveClientConfig();
+  const watcher = new WatchClient(clientConfig, { run });
+  watcher.on("event", (line) => ctx.output.appendLine(`[watch ${run}] event @${line.cursor} ${line.event.type}`));
+  watcher.on("stream", (line) => ctx.output.appendLine(`[watch ${run}] ${line.seat}> ${line.line}`));
   watcher.on("close", (info) => {
     ctx.output.appendLine(`[watch ${run}] closed (${info.stopped ? "detached" : "ended"}, code ${info.code}).`);
     ctx.watchers.delete(run);
   });
-
   watcher.start();
   ctx.watchers.set(run, watcher);
   ctx.output.show(true);
-  vscode.window.showInformationMessage(
-    `Conclave: attached to "${run}" (watch-only). Live events stream to the Conclave output channel. Use 'Stop run' to detach.`
-  );
+  // Also focus it in the sidebar so its board/ledger populate.
+  await ctx.focusRun(run);
+  vscode.window.showInformationMessage(`Conclave: attached to "${run}". Live events stream to the sidebar + output.`);
 }
 
 // ── rendering helper ─────────────────────────────────────────────────────────

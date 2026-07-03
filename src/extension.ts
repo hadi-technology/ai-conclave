@@ -2,9 +2,12 @@
  * Conclave — VS Code / Cursor extension entry point.
  *
  * Thin client. Owns lifecycle (activate/deactivate), reads settings, resolves an
- * EngineClient through the single seam (src/engine/*), and registers the E1 core
- * commands. No orchestration logic lives here — every read/action flows through
- * the engine client, which spawns `collab` and speaks only the JSON contract.
+ * EngineClient through the single seam (src/engine/*), wires the E2 native UX
+ * (sidebar tree views, status bar, gate notifications, guided start-run flow that
+ * drives an orchestrate child), and registers the commands. No orchestration
+ * logic lives here — every read/action flows through the engine client + the
+ * `collab watch --json` feed. Long-lived driving is delegated to a managed
+ * `collab orchestrate` child (OrchestrateController), never reimplemented.
  */
 import * as vscode from "vscode";
 
@@ -12,17 +15,40 @@ import { EngineClient, type ClientConfig } from "./engine/client.js";
 import { EngineError } from "./engine/errors.js";
 import { provision, type EngineConfig, type ProvisionResult } from "./engine/provision.js";
 import { WatchClient } from "./engine/watch.js";
-import { registerCommands } from "./commands.js";
+import { StateBus } from "./statebus.js";
+import { OrchestrateController } from "./orchestrate.js";
+import { presentGate } from "./gates.js";
+import { registerViews, type ViewData } from "./views.js";
+import { registerCommands, openReportForRun } from "./commands.js";
+import { emptyModel, type RunModel } from "./viewmodels/model.js";
+import { planBuildTarget } from "./viewmodels/startRun.js";
+import { prepareBuildTarget } from "./buildTarget.js";
+import { scratchRoot } from "./startRunFlow.js";
+import { join } from "node:path";
+import type { RunSummary } from "./engine/contract.js";
 
 /** Shared context handed to command handlers. */
 export interface ConclaveContext {
   readonly output: vscode.OutputChannel;
-  /** Live watch attachments, keyed by run ref — so Stop run can detach them. */
+  /** Live watch attachments, keyed by run ref — so Stop watching can detach them. */
   readonly watchers: Map<string, WatchClient>;
-  /** Resolve a ready-to-drive engine client (locates Node ≥25 + engine, checks schema). */
+  /** Managed orchestrate children, keyed by run ref — so Stop tears them down. */
+  readonly orchestrators: Map<string, OrchestrateController>;
+  /** Resolve a ready-to-drive engine client. */
   resolveClient(): Promise<EngineClient>;
-  /** Provision only (version/compat check) without building a client. */
+  /** The resolved ClientConfig (nodePath/enginePath/cwd/adaptersDir). */
+  resolveClientConfig(): Promise<ClientConfig>;
+  /** Provision only (version/compat check). */
   ensureProvisioned(): Promise<ProvisionResult>;
+  /** The live state bus (built lazily on first use). */
+  ensureBus(): Promise<StateBus>;
+  /** Focus a run in the views + attach its live feed. */
+  focusRun(runRef: string): Promise<void>;
+  /** Spawn the orchestrate child that drives a run. `target` is the pre-prepared
+   *  build dir (from the start-run flow); when absent, a safe one is resolved. */
+  driveRun(runRef: string, opts?: { fullAuto?: boolean; target?: string }): Promise<void>;
+  /** Stop driving + watching a run. */
+  stopRun(runRef: string): void;
 }
 
 let cachedProvision: { signature: string; result: ProvisionResult } | undefined;
@@ -58,18 +84,16 @@ async function ensureProvisioned(): Promise<ProvisionResult> {
   return result;
 }
 
-async function resolveClient(): Promise<EngineClient> {
+async function resolveClientConfig(): Promise<ClientConfig> {
   const cwd = workspaceCwd();
   const prov = await ensureProvisioned();
   const cfg = vscode.workspace.getConfiguration("conclave");
   const adaptersDir = cfg.get<string>("adaptersDir", "").trim();
-  const clientConfig: ClientConfig = {
-    nodePath: prov.nodePath,
-    enginePath: prov.enginePath,
-    cwd,
-    adaptersDir: adaptersDir || undefined
-  };
-  return new EngineClient(clientConfig);
+  return { nodePath: prov.nodePath, enginePath: prov.enginePath, cwd, adaptersDir: adaptersDir || undefined };
+}
+
+async function resolveClient(): Promise<EngineClient> {
+  return new EngineClient(await resolveClientConfig());
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -77,32 +101,171 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(output);
 
   const watchers = new Map<string, WatchClient>();
+  const orchestrators = new Map<string, OrchestrateController>();
 
   // Invalidate the provisioning cache when engine/node settings change.
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (
-        e.affectsConfiguration("conclave.nodePath") ||
-        e.affectsConfiguration("conclave.enginePath")
-      ) {
+      if (e.affectsConfiguration("conclave.nodePath") || e.affectsConfiguration("conclave.enginePath")) {
         cachedProvision = undefined;
         output.appendLine("[conclave] engine/node settings changed — will re-provision on next command.");
       }
     })
   );
 
+  // A change signal the views subscribe to, backed by the bus once it exists.
+  const onChangeEmitter = new vscode.EventEmitter<void>();
+  context.subscriptions.push(onChangeEmitter);
+
+  let bus: StateBus | null = null;
+  let busInit: Promise<StateBus> | null = null;
+
+  async function ensureBus(): Promise<StateBus> {
+    if (bus) return bus;
+    if (busInit) return busInit;
+    busInit = (async () => {
+      const clientConfig = await resolveClientConfig();
+      const client = new EngineClient(clientConfig);
+      const makeWatch = (run: string) => new WatchClient(clientConfig, { run });
+      const b = new StateBus(client, makeWatch);
+      b.on("change", () => onChangeEmitter.fire());
+      b.on("log", (line) => output.appendLine(`[bus] ${line}`));
+      b.on("gate", (gate, runRef) => {
+        void presentGate(gate, {
+          client,
+          runRef,
+          log: (l) => output.appendLine(`[gate] ${l}`),
+          openReport: (r) => openReportForRun(ctx, r),
+          stop: (r) => stopRun(r)
+        });
+      });
+      bus = b;
+      await b.refreshRuns();
+      return b;
+    })();
+    return busInit;
+  }
+
+  async function focusRun(runRef: string): Promise<void> {
+    const b = await ensureBus();
+    b.attach(runRef);
+    onChangeEmitter.fire();
+    await vscode.commands.executeCommand("conclave.runsView.focus");
+  }
+
+  async function driveRun(runRef: string, opts?: { fullAuto?: boolean; target?: string }): Promise<void> {
+    if (orchestrators.has(runRef)) return; // already driving
+    const clientConfig = await resolveClientConfig();
+    const client = new EngineClient(clientConfig);
+    const runsResp = await client.runs();
+    const summary = runsResp.runs.find((r) => r.name === runRef || String(r.id) === runRef);
+    if (!summary) throw new EngineError("run_not_found", `No run named "${runRef}"`, "Refresh the Runs view.");
+
+    // Resolve a SAFE build target. When start-run already prepared one, use it;
+    // otherwise (the standalone "Drive run" command) plan + confirm + prepare one,
+    // so we never build in the live workspace root silently.
+    let target = opts?.target;
+    if (!target) {
+      const cfg = vscode.workspace.getConfiguration("conclave");
+      const plan = planBuildTarget({
+        configuredTargetDir: cfg.get<string>("targetDir", ""),
+        workspaceRoot: clientConfig.cwd,
+        scratchRoot: scratchRoot(),
+        runLabel: `${runRef}-${Date.now()}`
+      });
+      const where = plan.mode === "scratch" ? "an isolated scratch copy of your repo" : plan.target;
+      const warn = plan.warnLiveRepo ? " WARNING: that is your LIVE workspace repo (worktrees/branches/commits land there)." : "";
+      const ok = await vscode.window.showWarningMessage(
+        `Drive "${runRef}"? The fleet will build in: ${plan.target} (${where}).${warn} This spends real money/quota on your subscriptions.`,
+        { modal: true },
+        "Drive run"
+      );
+      if (ok !== "Drive run") return;
+      target = await prepareBuildTarget(plan, clientConfig.cwd);
+    }
+
+    // Pin the store to the WORKSPACE store — the orchestrate child runs with cwd =
+    // the (scratch) target, so without this it would look for .collab there.
+    const storePath = clientConfig.storePath ?? join(clientConfig.cwd, ".collab", "store.db");
+
+    const controller = new OrchestrateController(
+      { ...clientConfig, storePath, execute: true, target },
+      summary.id,
+      {
+        onLog: (line) => output.appendLine(`[orchestrate ${runRef}] ${line}`),
+        onExit: ({ code, stopped }) => {
+          output.appendLine(`[orchestrate ${runRef}] exited (code ${code}, ${stopped ? "stopped" : "idle/done"}).`);
+          // The bus's gate handler resolves any pending gate; resolving it fires a
+          // change and the user (or full-auto) can resume driving.
+        }
+      }
+    );
+    orchestrators.set(runRef, controller);
+    controller.start();
+    output.appendLine(
+      `[conclave] driving "${runRef}" (#${summary.id}) via orchestrate child in ${target}${opts?.fullAuto ? " (full-auto)" : ""}.`
+    );
+  }
+
+  function stopRun(runRef: string): void {
+    const controller = orchestrators.get(runRef);
+    if (controller) {
+      controller.stop();
+      orchestrators.delete(runRef);
+      output.appendLine(`[conclave] stopped driving "${runRef}".`);
+    }
+    const w = watchers.get(runRef);
+    if (w) {
+      w.stop();
+      watchers.delete(runRef);
+      output.appendLine(`[conclave] detached live watch for "${runRef}".`);
+    }
+  }
+
   const ctx: ConclaveContext = {
     output,
     watchers,
+    orchestrators,
     resolveClient,
-    ensureProvisioned
+    resolveClientConfig,
+    ensureProvisioned,
+    ensureBus,
+    focusRun,
+    driveRun,
+    stopRun
   };
+
+  // ── Views + status bar ───────────────────────────────────────────────────────
+  const viewData: ViewData = {
+    runs: () => bus?.runs ?? ([] as RunSummary[]),
+    model: () => bus?.runModel ?? (emptyModel() as RunModel),
+    activeRunRef: () => bus?.activeRunRef ?? null,
+    activeSummary: () => bus?.activeRunSummary() ?? null,
+    onChange: onChangeEmitter.event
+  };
+  const views = registerViews(context, viewData);
+  context.subscriptions.push({ dispose: () => views.dispose() });
+
+  // Kick the bus so the views populate (best-effort; tolerates no engine yet).
+  void ensureBus().catch((err) => {
+    output.appendLine(`[conclave] engine not ready yet: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   registerCommands(context, ctx);
 
-  output.appendLine("[conclave] activated. Run a command from the palette (Conclave: …).");
+  context.subscriptions.push({
+    dispose: () => {
+      for (const c of orchestrators.values()) c.stop();
+      orchestrators.clear();
+      for (const w of watchers.values()) w.stop();
+      watchers.clear();
+      bus?.dispose();
+    }
+  });
+
+  output.appendLine("[conclave] activated.");
 }
 
 export function deactivate(): void {
-  // Nothing persistent to tear down; watchers are disposed via subscriptions.
+  // Watchers/orchestrators/bus are torn down via subscriptions.
 }

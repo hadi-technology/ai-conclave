@@ -13,6 +13,7 @@ import { execFile } from "node:child_process";
 
 import { EngineError } from "./errors.js";
 import type {
+  BudgetRaiseResult,
   BudgetShow,
   ErrorEnvelope,
   GateApproveResult,
@@ -203,6 +204,13 @@ export class EngineClient {
     const args = ["gate", "reject", "--feedback", opts.feedback];
     if (opts.run) args.push("--run", opts.run);
     return this.runJson<GateRejectResult>(args);
+  }
+
+  /** Lift the spend ceiling and clear any pending budget_exceeded gate. Wraps `collab budget raise --to <usd>`. */
+  budgetRaise(opts: { run?: string; toUsd: number }): Promise<BudgetRaiseResult> {
+    const args = ["budget", "raise", "--to", String(opts.toUsd)];
+    if (opts.run) args.push("--run", opts.run);
+    return this.runJson<BudgetRaiseResult>(args);
   }
 }
 
