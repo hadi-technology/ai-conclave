@@ -136,6 +136,36 @@
         "title": "Refresh",
         "category": "Conclave",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "conclave.showFindings",
+        "title": "Show QA findings (jump to file:line)",
+        "category": "Conclave",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "conclave.reviewUnit",
+        "title": "Review unit change (native diff)",
+        "category": "Conclave",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "conclave.openIntegrationDiff",
+        "title": "Open produced diff (integration vs base)",
+        "category": "Conclave",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "conclave.revealBuildTarget",
+        "title": "Reveal build target",
+        "category": "Conclave",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "conclave.takeoverSeat",
+        "title": "Take over seat",
+        "category": "Conclave",
+        "icon": "$(terminal)"
       }
     ],
     "menus": {
@@ -154,6 +184,21 @@
           "command": "conclave.refresh",
           "when": "view == conclave.runsView || view == conclave.seatsView || view == conclave.boardView || view == conclave.ledgerView",
           "group": "navigation@2"
+        },
+        {
+          "command": "conclave.showFindings",
+          "when": "view == conclave.boardView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "conclave.openIntegrationDiff",
+          "when": "view == conclave.boardView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "conclave.takeoverSeat",
+          "when": "view == conclave.seatsView",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -171,6 +216,26 @@
           "command": "conclave.openReport",
           "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
           "group": "conclave@1"
+        },
+        {
+          "command": "conclave.showFindings",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "conclave@2"
+        },
+        {
+          "command": "conclave.reviewUnit",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "conclave@3"
+        },
+        {
+          "command": "conclave.openIntegrationDiff",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "conclave@4"
+        },
+        {
+          "command": "conclave.revealBuildTarget",
+          "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",
+          "group": "conclave@5"
         }
       ],
       "commandPalette": [

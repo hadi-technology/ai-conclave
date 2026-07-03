@@ -48,6 +48,7 @@ export class StateBus extends EventEmitter {
   private runsList: RunSummary[] = [];
   private model: RunModel = emptyModel();
   private lastTally: TallyProjection | null = null;
+  private lastSnapshot: Record<string, unknown> | null = null;
   private activeRun: string | null = null;
   private watch: WatchClient | null = null;
   private lastGateId: number | null = null;
@@ -69,6 +70,11 @@ export class StateBus extends EventEmitter {
   /** The most recent decide-phase tally (from the last snapshot), or null. */
   get tally(): TallyProjection | null {
     return this.lastTally;
+  }
+  /** The raw cockpit-shaped snapshot state (carries seats[].session/paused —
+   *  needed by the takeover hatch), or null before the first snapshot. */
+  get snapshotState(): Record<string, unknown> | null {
+    return this.lastSnapshot;
   }
   get activeRunRef(): string | null {
     return this.activeRun;
@@ -103,11 +109,13 @@ export class StateBus extends EventEmitter {
     this.activeRun = runRef;
     this.model = emptyModel();
     this.lastTally = null;
+    this.lastSnapshot = null;
     this.lastGateId = null;
 
     const w = this.makeWatch(runRef);
     w.on("snapshot", (line) => {
       const state = line.state as SnapshotState;
+      this.lastSnapshot = line.state as Record<string, unknown>;
       this.model = modelFromSnapshot(state);
       this.lastTally = tallyFromSnapshot(state.tally);
       this.detectGate();

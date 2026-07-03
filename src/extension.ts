@@ -21,6 +21,9 @@ import { presentGate } from "./gates.js";
 import { registerViews, type ViewData } from "./views.js";
 import { registerCommands, openReportForRun } from "./commands.js";
 import { CockpitPanel } from "./cockpit.js";
+import { FindingsManager } from "./findings.js";
+import { reviewUnit, openIntegrationDiff, revealBuildTarget } from "./diffReview.js";
+import { takeoverSeat } from "./takeover.js";
 import { emptyModel, type RunModel } from "./viewmodels/model.js";
 import { planBuildTarget } from "./viewmodels/startRun.js";
 import { prepareBuildTarget } from "./buildTarget.js";
@@ -35,6 +38,18 @@ export interface ConclaveContext {
   readonly watchers: Map<string, WatchClient>;
   /** Managed orchestrate children, keyed by run ref — so Stop tears them down. */
   readonly orchestrators: Map<string, OrchestrateController>;
+  /** Build targets (the fleet's scratch clone) per run ref — populated when a run
+   *  is driven this session; E4 diff/jump/takeover resolve file paths + git here. */
+  readonly targets: Map<string, string>;
+  /** The build target a run's produced code lives in. Falls back to the
+   *  configured targetDir, then the workspace root, for runs not driven here.
+   *  Callers that need PROVENANCE (e.g. jumping into produced code) must use
+   *  {@link knownBuildTargetFor} instead — the fallback here can point at an
+   *  arbitrary same-named tree. */
+  buildTargetFor(runRef: string): string;
+  /** The build target ONLY when it is provenance-known (the run was driven this
+   *  session, tracked in `targets`); null otherwise. No fallback tree. */
+  knownBuildTargetFor(runRef: string): string | null;
   /** Resolve a ready-to-drive engine client. */
   resolveClient(): Promise<EngineClient>;
   /** The resolved ClientConfig (nodePath/enginePath/cwd/adaptersDir). */
@@ -103,6 +118,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const watchers = new Map<string, WatchClient>();
   const orchestrators = new Map<string, OrchestrateController>();
+  const targets = new Map<string, string>();
+
+  function buildTargetFor(runRef: string): string {
+    const tracked = targets.get(runRef);
+    if (tracked) return tracked;
+    const cfg = vscode.workspace.getConfiguration("conclave");
+    const configured = cfg.get<string>("targetDir", "").trim();
+    if (configured) return configured;
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  }
+
+  function knownBuildTargetFor(runRef: string): string | null {
+    return targets.get(runRef) ?? null;
+  }
 
   // Invalidate the provisioning cache when engine/node settings change.
   context.subscriptions.push(
@@ -184,6 +213,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (ok !== "Drive run") return;
       target = await prepareBuildTarget(plan, clientConfig.cwd);
     }
+    // Track the build target so E4 diff/jump/takeover can resolve this run's
+    // produced code + git (the target path is not in the JSON contract).
+    targets.set(runRef, target);
 
     // Pin the store to the WORKSPACE store — the orchestrate child runs with cwd =
     // the (scratch) target, so without this it would look for .collab there.
@@ -227,6 +259,9 @@ export function activate(context: vscode.ExtensionContext): void {
     output,
     watchers,
     orchestrators,
+    targets,
+    buildTargetFor,
+    knownBuildTargetFor,
     resolveClient,
     resolveClientConfig,
     ensureProvisioned,
@@ -264,6 +299,63 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(`Conclave: ${message}`);
       })
     )
+  );
+
+  // ── E4: native code integration (findings, diffs, takeover) ──────────────────
+  const findings = new FindingsManager(ctx);
+  context.subscriptions.push({ dispose: () => findings.dispose() });
+
+  // Resolve a run ref for an E4 command: explicit arg → active run → pick one.
+  async function resolveRunArg(arg: unknown): Promise<string | null> {
+    if (typeof arg === "string") return arg;
+    if (arg && typeof arg === "object" && typeof (arg as { runRef?: unknown }).runRef === "string") {
+      return (arg as { runRef: string }).runRef;
+    }
+    const b = await ensureBus();
+    if (b.activeRunRef) return b.activeRunRef;
+    const { runs } = await new EngineClient(await resolveClientConfig()).runs();
+    if (runs.length === 0) return null;
+    if (runs.length === 1) return runs[0].name;
+    const pick = await vscode.window.showQuickPick(
+      runs.map((r) => ({ label: r.name, description: `#${r.id} · ${r.phase}`, run: r })),
+      { placeHolder: "Which run?" }
+    );
+    return pick ? pick.run.name : null;
+  }
+
+  const e4 = (id: string, fn: (run: string, arg: unknown) => Promise<void>) =>
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, async (arg?: unknown) => {
+        try {
+          const run = await resolveRunArg(arg);
+          if (!run) {
+            vscode.window.showInformationMessage("Conclave: no run available. Start one first.");
+            return;
+          }
+          await fn(run, arg);
+        } catch (err) {
+          const shown = err instanceof EngineError ? err.toDisplay() : err instanceof Error ? err.message : String(err);
+          output.appendLine(`[conclave] E4 command ${id} failed: ${shown}`);
+          void vscode.window.showErrorMessage(`Conclave: ${shown}`);
+        }
+      })
+    );
+
+  e4("conclave.showFindings", (run) => findings.showFindings(run));
+  e4("conclave.reviewUnit", (run) => reviewUnit(ctx, run));
+  e4("conclave.openIntegrationDiff", (run) => openIntegrationDiff(ctx, run));
+  e4("conclave.revealBuildTarget", (run) => revealBuildTarget(ctx, run));
+  e4("conclave.takeoverSeat", () => takeoverSeat(ctx));
+
+  // Keep the Problems panel in sync as findings change on the watch feed (throttled).
+  let findingsRefreshAt = 0;
+  context.subscriptions.push(
+    onChangeEmitter.event(() => {
+      const now = Date.now();
+      if (now - findingsRefreshAt < 2000) return;
+      findingsRefreshAt = now;
+      void findings.refreshActive(bus?.activeRunRef ?? null);
+    })
   );
 
   context.subscriptions.push({
