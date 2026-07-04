@@ -4,6 +4,12 @@
 user can't get set up, and (2) the tool expects an already-scoped problem — and the
 plan to close them so Conclave feels like one product instead of "a CLI plus a viewer."
 
+> **v2 — reviewed by an independent pass (codex), incorporated below.** Directionally the
+> architecture holds (discovery is engine-seated; the run spec is the contract), but the
+> review caught a real contract bug, corrected the ownership split, re-sequenced the phases
+> (engine acquisition + `doctor` are fresh-user blockers, not polish), and hardened the
+> onboarding/auth and auto-detect designs. The three required-before-code changes are in §10.
+
 ---
 
 ## 1. The target experience
@@ -27,7 +33,7 @@ The extension is a clean **thin client**: it spawns the `collab` engine, reads `
 | Assumed present | Fresh user reality | Extension help today |
 |---|---|---|
 | Node ≥ 25 | maybe (default is often Node 20) | ✅ detects + friendly "set `conclave.nodePath`" |
-| The engine (`wrk2gthr`) | absent (not bundled) | ❌ none — manual clone |
+| The engine (`wrk2gthr`) | absent (not bundled); `provision.ts` has a machine-specific default path | ❌ none — manual clone |
 | Adapters (`adapters/*.json`) | none; hand-writing is expert-level | ❌ `collab adapters --json` just lists what exists (nothing) |
 | Vendor CLIs installed + authed | some, maybe | ❌ not detected, not guided |
 | A scoped problem + criteria | user has a vague idea | ❌ no discovery phase |
@@ -43,27 +49,36 @@ discovery layers are what's missing.
 
 1. **Thin client stays thin.** No embedded LLM, no DB access, no new API keys. The
    *intelligence* and *process spawning* live in the engine — or in one of the user's
-   own CLIs, **seated by the engine**.
-2. **The engine owns** adapters, sessions, spawning, and the run pipeline. The extension
-   is the UI over it (plus the one thing it already does: spawn `collab`).
+   own CLIs, **seated by the engine**. The extension already treats `collab` as the only
+   execution boundary (`EngineClient` is deliberately just a JSON-command wrapper); keep it.
+2. **Ownership is three-way** (the review corrected this — don't say "the engine or the skill"):
+   - **Skill** owns *dialogue policy* — how the scoping conversation is run.
+   - **Engine** owns *adapter execution, transcript streaming, cancellation, validation, and
+     final run-spec emission*.
+   - **Extension** owns *review / edit / launch UI and status*.
 3. **Vendor-neutral, on the user's own subscriptions.** Everything runs through CLIs the
    user already pays for.
-4. **The run spec is the seam** between discovery and execution (see §5.1).
-5. **Credential boundary:** the extension *detects and guides*; the **user** installs CLIs
-   and authenticates. The extension never handles keys or logins on their behalf — correct
-   security, and a trust signal.
+4. **The run spec is the seam** between discovery and execution (see §5.1), and it is a
+   **versioned engine contract with engine-side validation** — not just "the LLM emits JSON."
+5. **Credential boundary — stated honestly.** "We never collect credentials" is true. "We can
+   reliably detect that a vendor is authenticated" is **not** true. The extension detects best
+   effort, guides login, and re-probes; the **user** installs + authenticates; the run itself
+   is the real proof of readiness.
 
 ---
 
 ## 4. The gaps
 
 ### A — Onboarding (fresh user)
-- **A1 Engine acquisition** — `wrk2gthr` isn't bundled; nothing to point `enginePath` at.
+- **A1 Engine acquisition** — `wrk2gthr` isn't bundled; `provision.ts` still defaults to a
+  machine-specific path. **This is a blocker, not polish.**
 - **A2 Node ≥ 25** — detected + guided, but not installed.
-- **A3 Vendor-CLI detection** — is `claude`/`codex`/`glm` on PATH? Authenticated? Not checked.
+- **A3 Vendor-CLI detection** — is `claude`/`codex`/`glm` on PATH? Authenticated? Not checked —
+  and *reliable* detection is hard (see §5.2).
 - **A4 Adapter scaffolding** — the shipped `claude/glm/codex.json` are hand-written with
   **machine-specific paths**; there's no auto-generate for a new machine.
-- **A5 Auth guidance** — missing auth isn't detected or explained.
+- **A5 Auth guidance** — missing auth isn't detected or explained; and auth state is only
+  knowable as a tri-state, not a boolean.
 - **A6 No welcome/setup surface** — no wizard ties the above together.
 
 ### B — Discovery / scoping
@@ -74,92 +89,123 @@ discovery layers are what's missing.
 
 ### C — Entry & visibility
 - **C1 No direct start input** — starting a run means `Cmd-P` → command list → describe.
-- **C2 No auto-detect** — a run started outside the extension (e.g. by a chat agent) doesn't
-  surface until you manually **Attach**. There's no always-on runs-changed listener.
+  (Note: `startRunFlow` already collects inputs, warns on spend, prepares a scratch target,
+  starts, and drives — so this is **mostly discoverability**, a button over existing logic.)
+- **C2 No auto-detect** — a run started outside the extension doesn't surface until you
+  manually **Attach**. The engine channel exists (`watch --all` / `runs-changed`), but the
+  extension side is **not** small (see §5.5).
 
 ---
 
 ## 5. The design
 
-### 5.1 The run spec — the seam
+### 5.1 The run spec — the seam (RunSpec v1, a versioned + validated contract)
 
-One contract object is produced by discovery and consumed by `collab run start`.
-Everything converges here, so both front doors (chat + panel) stay interchangeable.
+Produced by discovery, consumed by `collab run start`. It must be a real engine contract,
+not an ad-hoc JSON blob. **Bug caught in review:** the client's `runStart` takes
+`criteria?: string`, so criteria is a **string**, not an array — match the contract.
 
 ```jsonc
 {
-  "goal": "…",                       // the scoped problem statement
-  "acceptanceCriteria": ["…"],       // falsifiable "done" — tests/checks/checklist
-  "seats": ["claude", "glm"],        // which agents sit (>= 2 vendors for cross-QA)
-  "domain": "coding",                // coding | writing | research
-  "approval": "plan-only",           // plan-only | plan+risky-deliver | final
-  "routing": "usage-aware",          // usage-aware | efficiency | auto
-  "budgetUsd": 5,                    // optional ceiling
-  "ceremony": "full"                 // full | editorial | lightweight
+  "schemaVersion": 1,
+  "origin": "skill:w2g@1.2.0",     // provenance: which skill/version, or "panel"
+  "runName": "rate-limiter",        // optional human handle
+  "goal": "…",                      // the scoped problem statement
+  "criteria": "…",                  // STRING — matches `collab run start --criteria`
+  "seats": ["claude", "glm"],       // NORMALIZED adapter ids (not display names); >=2 vendors
+  "domain": "coding",               // coding | writing | research
+  "approval": "plan-only",          // plan-only | plan+risky-deliver | final
+  "autonomy": { "fullAuto": false },// gate autonomy (explicit, not implied by approval)
+  "routing": "usage-aware",
+  "budgetUsd": 5,                   // optional ceiling
+  "ceremony": "full",              // full | editorial | lightweight
+  "buildTargetMode": "scratch",     // scratch | explicit — where the fleet builds
+  "workspaceRoot": "/abs/path",     // repo-context policy for discovery + build target
+  "repoContext": "read",            // read | none
+  "checkCommands": ["npm test", "tsc --noEmit"], // the falsifiable "done", machine-runnable
+  "expectedArtifacts": [],          // optional
+  "maxTurns": 40                    // or a wall-clock ceiling
 }
 ```
 
-The extension always lets the user **review/edit** the spec before launch (safety net for
-imperfect scoping).
+**Harden it (the editable-spec UI is NOT the validator).** The failure mode isn't only "bad
+JSON" — it's *almost-right* JSON: stale/renamed adapter ids, impossible budgets, vague
+criteria, unsafe build assumptions. So:
+- engine-side **`collab run-spec validate --json`** with a JSON Schema (single source of truth),
+- **strict extraction markers** — the skill wraps the spec in fenced sentinels so it's parsed
+  unambiguously, not scraped from prose,
+- a **repair-attempt limit** (ask the seat to fix a failed spec N times, then surface errors),
+- a **user-visible validation error list**; the editable spec is a convenience, the validator
+  is the gate.
 
-### 5.2 Onboarding — "Set up Conclave"
+### 5.2 Onboarding — "Set up Conclave" (and why detection is hard)
 
-**Engine (new): `collab init` / `collab doctor`.** Probe `PATH` for the vendor CLIs it has
-templates for (claude/codex/glm), check whether each is authenticated, and **scaffold
-adapter JSONs from built-in templates using the *detected* local paths** — turning today's
-hand-written reference configs into real templates. Emit a machine-readable status report.
+**Engine (new): `collab doctor --json` / `collab init`.** Probe for the vendor CLIs it has
+templates for, report status, and **preview then scaffold** adapters from built-in templates
+using the *detected* local paths. Reality the design must handle (per review):
+- **PATH mismatch:** the VS Code/Cursor extension-host PATH is often **not** the user's login
+  shell PATH. nvm/asdf/Homebrew shims, npm-global installs, multiple `codex` binaries,
+  app-bundled CLIs, Windows PATH, and stale symlinks all produce bad scaffolds. `doctor` must
+  resolve the user's real shell environment / known install locations, and **preview** the
+  exact resolved command paths before writing anything.
+- **Auth is a tri-state, not a boolean:** `unknown | probably_ready | failed_probe`.
+  `claude --version` proves *install*, not *login*. Per-vendor env like GLM's `ZAI_API_KEY` /
+  `ANTHROPIC_*` may exist in a login shell but not in the extension process. Some vendors can
+  only be verified by a real command that **spends quota** — that probe must be **opt-in**.
+- **Adapter scaffolds run arbitrary local commands**, so scaffolding is a reviewable action:
+  show the resolved commands; don't silently write+execute.
 
-**Extension (new): a welcome view** — a checklist with live status, fix actions, and a
+**Extension (new): a welcome view** — a checklist with tri-state status, fix actions, and a
 Recheck button:
 
 ```
 Node ≥ 25        ✓  /opt/homebrew/bin/node
-Engine           ✓  wrk2gthr detected        ( or [ Get the engine ] )
-Agents detected
-  claude         ✓  authenticated            → seated
-  codex          ✗  not signed in            → run: codex login
-  glm            ✗  no ZAI_API_KEY            → set it, then Recheck
-[ Set up my agents ]   → collab init: scaffolds adapters for the ready ones
+Engine           ✓  wrk2gthr located          ( or [ Get the engine ] )
+Agents
+  claude         ✓  found · probably ready     → seated
+  codex          ⚠  found · auth unknown       → run: codex login, then Recheck
+  glm            ✗  not found / no ZAI_API_KEY  → install + set key, then Recheck
+[ Preview & set up my agents ]   → collab init: shows resolved commands, scaffolds ready ones
 ```
 
-The extension **detects + guides**; one click scaffolds adapters for whatever's ready. The
-**user** performs installs/auth (per the credential boundary).
+Honest copy: readiness is best-effort; **the first run is the real auth test**, and failures
+must be legible (which seat, which vendor, what to run).
 
-### 5.3 Discovery — an Intake seat running the skill protocol
+### 5.3 Discovery — an Intake seat running the skill protocol *(Phase 3 — after doctor + spec validation)*
 
-The key insight: the extension doesn't need its own LLM. It seats **one of the user's own
-CLIs** for discovery — the same CLIs it will later seat for the run.
+The extension doesn't need its own LLM — it seats **one of the user's own CLIs** for
+discovery, through the engine, the same way the run will.
 
 - **Engine (new): an Intake/Scope mode.** Seat one CLI (the user's pick), run the skill's
-  scoping protocol, stream the conversation, and **end by emitting a run spec** (§5.1). This
-  reuses the engine's existing adapter/session machinery (L0–L2 ladder) — the extension does
+  scoping *dialogue*, stream the transcript, support **cancel/abort**, and end by emitting a
+  **validated** RunSpec v1. Reuses the adapter/session machinery (L0–L2) — the extension does
   **not** reimplement CLI spawning or turn management.
-- **Skill (formalize): the discovery protocol.** A portable scoping prompt + one hard rule:
-  *finish by emitting a clean run-spec block.* The **same** artifact runs in the chat agent
-  and in the extension's Intake seat.
-- **Extension (new): a discovery panel** — an input box, the relayed Q&A, an **editable
-  proposed spec**, and a Launch button.
+- **Skill:** owns the dialogue policy + the "emit a spec inside sentinels" contract. Same
+  artifact in the chat agent and the Intake seat.
+- **Extension:** a discovery panel — input, relayed Q&A, **cost preview**, an **editable +
+  validated** proposed spec, Launch, and a clean **abort/partial-transcript** path.
 
-**Two front doors, one protocol:**
-- **Chat-native** (the skill in your coding agent) — repo-aware, scopes with full codebase
-  context. Best for IDE power users.
-- **Extension-native** (the Intake seat) — self-contained in the panel, on the user's subs.
-  Best for standalone/GUI users.
-
-Give the Intake seat the workspace path + read access so it isn't blind, but keep the chat
-door as the "scope with full repo context" path.
+**Two front doors, one protocol:** chat-native (repo-aware, via the agent) and extension-native
+(the Intake seat). Give the Intake seat workspace read access, but keep the chat door as the
+"scope with full repo context" path.
 
 ### 5.4 Direct start (C1)
 
-A first-class **Start** affordance in the Conclave sidebar / welcome view (input + button),
-not the command palette. Small, high ROI, independent of the rest.
+A first-class **Start** affordance in the sidebar / welcome view that launches the **existing**
+`startRunFlow`. Small; mostly discoverability.
 
-### 5.5 Auto-detect (C2)
+### 5.5 Auto-detect (C2) — a *separate* lifecycle component
 
-The extension runs an always-on **`collab watch --all`** (runs-changed) listener. On a new
-run it surfaces it and offers to attach / opens the cockpit. This is what makes a
-chat-started run **light up live** without a manual Attach. Small; the engine channel
-already exists.
+The engine channel exists (`WatchClient` supports `--all`; emits `runs-changed`), so the engine
+side is small. The **extension side is not**: `StateBus` is built around one active run, one
+run-scoped watcher, and an explicit `detached` latch (and `refreshRuns()` auto-attaches unless
+detached). Bolting global watch into it risks **surprise re-attach after the user detached**.
+
+So: implement a standalone **`GlobalRunsWatcher`** in extension lifecycle, scoped per
+workspace/store, that runs `collab watch --all` and **only refreshes the run list + prompts /
+offers to attach**. It must **never** mutate active-run attach/detach state. Note the
+multi-root ambiguity: the extension currently collapses to `workspaceFolders[0]`, so global
+watch needs a deliberate per-store scoping decision.
 
 ---
 
@@ -167,52 +213,79 @@ already exists.
 
 ```
 Install extension
-  → Set up Conclave        (wizard: Node · engine · detect CLIs · scaffold adapters · auth)
+  → Set up Conclave        (locate/get engine · Node · doctor: detect CLIs · preview + scaffold adapters · auth guidance)
   → agents ready (>= 2 vendors)
-  → Discover               (panel Intake seat, or chat skill — same protocol, same spec)
-  → review / edit run spec
+  → Discover               (panel Intake seat, or chat skill — same protocol, same validated spec)
+  → review / edit run spec (validated by the engine)
   → Run                    (collab run start)
-  → Cockpit                (auto-detected; live Kanban, gates, takeover)
+  → Cockpit                (auto-detected via GlobalRunsWatcher; live Kanban, gates, takeover)
 ```
 
 ---
 
-## 7. Phased backlog
+## 7. Phased backlog (re-sequenced per review)
 
 | Phase | Item | Engine | Extension | Skill |
 |---|---|:--:|:--:|:--:|
-| **1 — friction** (small, high ROI) | C1 direct-start affordance | | ● | |
-| | C2 auto-detect via `watch --all` | (exists) | ● | |
-| **2 — onboarding** | `collab init` / `doctor`: detect CLIs, check auth, scaffold adapters from templates, status JSON | ● | | |
-| | "Set up Conclave" welcome wizard + auth guidance + Recheck | | ● | |
-| **3 — discovery bridge** | Intake/Scope mode (seat a CLI, run protocol, emit spec) | ● | | |
-| | Formalize the discovery protocol + run-spec contract | | | ● |
-| | Discovery panel (input · relayed Q&A · editable spec · Launch) | | ● | |
+| **1 — Fresh-user unblock** (the real MVP) | Engine locator + install/acquisition guidance (kill the machine-specific default path in `provision.ts`) | ● | ● | |
+| | `collab doctor --json`: robust CLI detection, auth **tri-state**, **preview + scaffold** adapters from templates | ● | | |
+| | "Set up Conclave" welcome view + auth guidance + Recheck | | ● | |
+| | Direct-start affordance (button over existing `startRunFlow`) | | ● | |
+| **2 — Contract + visibility** | **RunSpec v1** as a versioned engine contract + `collab run-spec validate --json` (JSON Schema) | ● | | |
+| | `GlobalRunsWatcher` (separate lifecycle component; never touches active-run state) | (exists) | ● | |
+| **3 — Discovery bridge** (only after 1 + 2 solid) | Intake/Scope mode: seat a CLI, run the dialogue, stream, cancel, emit a **validated** spec | ● | | |
+| | Formalize the discovery **dialogue protocol** + sentinel-wrapped spec emission | | | ● |
+| | Discovery panel: input · relayed Q&A · cost preview · editable+validated spec · abort · Launch | | ● | |
 | | Wire the chat front door to the same protocol/spec | | | ● |
-| **4 — marketplace** (see `REVIEW-BACKLOG.md`, E5–E7) | Engine acquisition/bundling/provisioning | ● | ● | |
-| | Cross-editor (VS Code + Cursor) onboarding QA | | ● | |
-| | Windows-safe takeover (adapter env in `seat pause`) | ● | ● | |
-| | Publish to VS Code Marketplace + Open VSX | | ● | |
+| **4 — Marketplace** (see `REVIEW-BACKLOG.md`, E5–E7) | Engine bundling/provisioning; telemetry policy; version compat (extension/engine/skill) | ● | ● | |
+| | Windows-safe takeover (adapter env in `seat pause`) + env redaction | ● | ● | |
+| | Cross-editor (VS Code + Cursor) onboarding QA; publish to Marketplace + Open VSX | | ● | |
 
 ---
 
-## 8. Open questions / risks
+## 8. Risks / must-consider (expanded per review)
 
-- **Interactive session handling for Intake.** Reuse the adapter L0–L2 ladder; decide
-  headless-resume vs PTY-interactive per adapter (codex resume is unwired — L1 today).
-- **Structured-output reliability.** The whole bridge depends on the skill emitting a clean
-  run-spec block; the editable-spec step is the safety net.
-- **Repo-awareness.** The chat door beats the panel here; give the Intake seat workspace
-  read, and be explicit that the panel scopes with less context.
-- **Engine acquisition.** Bundle vs `git clone` vs `npm` — affects A1 and provisioning.
-- **Token cost.** Discovery spends on the chosen sub; expected and fine, but surface it.
-- **Cross-platform.** The Windows-shell takeover item (`REVIEW-BACKLOG.md`) intersects the
-  "seat a CLI" work — the engine returning adapter env unblocks both.
+- **Auth is not reliably detectable.** Tri-state only; the first run is the real test; some
+  probes spend quota (opt-in).
+- **PATH / environment reality.** Extension-host PATH ≠ login shell; shims, multiple binaries,
+  Windows, app-bundled CLIs → bad scaffolds unless `doctor` resolves the real env and previews.
+- **RunSpec drift.** Almost-right JSON, stale adapter ids, impossible budgets — needs engine
+  validation + repair loop + visible errors, not just an editable field.
+- **Global watch lifecycle.** Surprise re-attach after detach; multi-root/multi-store ambiguity;
+  run-stop and workspace-switch races. Keep it isolated from `StateBus`.
+- **Discovery cancel/abort + partial transcript recovery.** Users will bail mid-interview.
+- **Offline / engine-absent** handling at every step (not just Node).
+- **Cost preview before Intake**, not only before the run — the interview itself spends.
+- **Security:** scaffolded adapters execute arbitrary local commands; treat scaffold as a
+  reviewable action, and redact env values in any surfaced spec/log.
+- **Version compatibility** across extension / engine / skill (schemaVersion already exists on
+  the JSON contract; extend the discipline to RunSpec + the skill protocol).
+- **Telemetry policy** — decide before any usage signal is added.
+- **Stale-adapter migration** when a CLI moves, updates, or a new install shadows the old path.
 
 ---
 
-## 9. Related docs
+## 9. Over-engineering check (review)
+
+The **Discovery panel is premature.** Most of the fresh-user value comes from **reliable setup**
+(`doctor` + engine acquisition) and **making the existing start flow visible**. Intake is worth
+building — but only *after* `doctor` and RunSpec validation are solid. Don't build the panel first.
+
+---
+
+## 10. The three changes required before any code (review)
+
+1. **Make `collab doctor`/`init` + engine acquisition Phase 1.** Provisioning still hard-codes a
+   machine-specific engine path — that's a fresh-user blocker, not marketplace polish.
+2. **Formalize `RunSpec v1` with engine-side validation *before* building Intake.** Fix
+   `criteria` to a string, add the missing fields (§5.1), ship `collab run-spec validate --json`.
+3. **Split global `watch --all` into a separate lifecycle component** that never mutates
+   active-run attach/detach state.
+
+---
+
+## 11. Related docs
 
 - `docs/ENGINE-GAPS.md` — engine contract gaps (closed).
-- `docs/REVIEW-BACKLOG.md` — consciously deferred findings (Windows shell, run+seat keying).
+- `docs/REVIEW-BACKLOG.md` — consciously deferred findings (Windows shell env, run+seat keying).
 - `docs/TESTING.md` — install + exercise guide.
