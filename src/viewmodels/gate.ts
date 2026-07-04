@@ -131,6 +131,32 @@ export type GateResolution =
   | { method: "openReport" }
   | { method: "stop" };
 
+/**
+ * Whether a resolved gate method CLEARS the pending gate engine-side. When it
+ * does, the orchestrate child (which exited idling on the gate) must be
+ * re-spawned to continue the run — see OrchestrateController.resume(). The
+ * read-only actions (openReport) and the teardown action (stop) do NOT clear a
+ * gate, so they must NOT re-spawn.
+ */
+export function resolutionClearsGate(method: GateResolution["method"]): boolean {
+  return method === "gateApprove" || method === "gateReject" || method === "budgetRaise";
+}
+
+/**
+ * Defensive TOCTOU guard for a stale gate notification. A native notification (or
+ * cockpit button) for gate #N can be clicked AFTER the run advanced to gate #N+1 —
+ * resolving it would approve/reject the WRONG gate. Given the id the user acted on
+ * and a fresh `gate show` read, this returns true ONLY when the engine still reports
+ * a pending gate with that exact id. `false` when the gate changed OR none pends now
+ * → the caller must refuse the mutation.
+ */
+export function gateStillPending(
+  actedGateId: number,
+  current: { gate: { id: number } | null } | null | undefined
+): boolean {
+  return !!current && !!current.gate && current.gate.id === actedGateId;
+}
+
 export interface ResolveInput {
   run: string;
   /** Free-text feedback, when the chosen action needsFeedback. */

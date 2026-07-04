@@ -53,6 +53,9 @@ export class StateBus extends EventEmitter {
   private watch: WatchClient | null = null;
   private lastGateId: number | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
+  /** Set by an explicit detach() so refreshRuns won't silently auto-re-attach.
+   *  Cleared by attach() (an explicit focus re-enables the live feed). */
+  private detached = false;
 
   constructor(
     private readonly client: EngineClient,
@@ -91,8 +94,9 @@ export class StateBus extends EventEmitter {
     try {
       const { runs } = await this.client.runs();
       this.runsList = runs;
-      // Auto-pick an active run if none is set.
-      if (!this.activeRun) {
+      // Auto-pick an active run if none is set — unless the user explicitly
+      // detached, in which case a runs refresh must NOT silently re-attach.
+      if (!this.activeRun && !this.detached) {
         const active = runs.find((r) => r.active) ?? runs[0];
         if (active) this.attach(active.name);
       }
@@ -102,8 +106,34 @@ export class StateBus extends EventEmitter {
     }
   }
 
+  /** Whether the live watch feed is currently attached to `runRef`. */
+  isWatching(runRef: string): boolean {
+    return this.activeRun === runRef && this.watch != null;
+  }
+
+  /**
+   * Detach the live watch viewer. If `runRef` is omitted or matches the active
+   * run, tear the watch down, clear the focused model, and mark detached so a
+   * later refreshRuns won't silently re-attach. Returns true iff it WAS watching
+   * (a real detach happened); false if the given run wasn't the active watch.
+   */
+  detach(runRef?: string): boolean {
+    if (runRef !== undefined && runRef !== this.activeRun) return false;
+    const wasWatching = this.watch != null;
+    this.detachWatch();
+    this.activeRun = null;
+    this.model = emptyModel();
+    this.lastTally = null;
+    this.lastSnapshot = null;
+    this.lastGateId = null;
+    this.detached = true;
+    this.emit("change");
+    return wasWatching;
+  }
+
   /** Focus a run: (re)attach the watch feed and load its model. */
   attach(runRef: string): void {
+    this.detached = false;
     if (this.activeRun === runRef && this.watch) return;
     this.detachWatch();
     this.activeRun = runRef;
@@ -113,7 +143,14 @@ export class StateBus extends EventEmitter {
     this.lastGateId = null;
 
     const w = this.makeWatch(runRef);
+    // Detached-watch guard (FIX B): each handler captures its OWN watch `w` (and
+    // `runRef`). A buffered callback from a PREVIOUS run's dying child still fires
+    // that run's watch after attach() swapped `this.watch`; guarding at the top of
+    // every handler means a stale watch can NEVER write this.model / emit for the
+    // new run. (The `snapshot` handler — which mutates model + detectGate — is the
+    // critical one; guard all four for consistency.)
     w.on("snapshot", (line) => {
+      if (this.watch !== w) return;
       const state = line.state as SnapshotState;
       this.lastSnapshot = line.state as Record<string, unknown>;
       this.model = modelFromSnapshot(state);
@@ -122,6 +159,7 @@ export class StateBus extends EventEmitter {
       this.emit("change");
     });
     w.on("event", (line) => {
+      if (this.watch !== w) return;
       this.emit("log", `event ${line.event.type}`);
       this.emit("event", {
         type: line.event.type,
@@ -132,8 +170,14 @@ export class StateBus extends EventEmitter {
       });
       this.scheduleReadRefresh();
     });
-    w.on("stream", (line) => this.emit("stream", line.seat, line.line));
-    w.on("reset", () => this.scheduleReadRefresh());
+    w.on("stream", (line) => {
+      if (this.watch !== w) return;
+      this.emit("stream", line.seat, line.line);
+    });
+    w.on("reset", () => {
+      if (this.watch !== w) return;
+      this.scheduleReadRefresh();
+    });
     w.on("error", (err) => this.emit("log", `watch error: ${err.message}`));
     w.start();
     this.watch = w;
@@ -159,6 +203,19 @@ export class StateBus extends EventEmitter {
         this.client.budgetShow(run).catch(() => null),
         this.client.gateShow(run).catch(() => null)
       ]);
+      // Stale-run guard: the reads are async; if the user switched runs (or
+      // detached) while they were in flight, `run` is no longer active — drop
+      // this result so run A's data never overwrites run B's model or fires a
+      // gate for B from A's reads.
+      if (this.activeRun !== run) return;
+      // Transient-blip guard (FIX C): every read is `.catch(() => null)`, so a brief
+      // engine unavailability makes ALL of them null and modelFromReads would REPLACE
+      // the good model with an empty one (the UI blanks). Only replace when at least
+      // one read succeeded; otherwise keep the prior model until the next refresh.
+      if (status == null && report == null && ledger == null && budget == null && gate == null) {
+        this.emit("log", "read refresh: all engine reads failed, keeping prior model");
+        return;
+      }
       this.model = modelFromReads({ status, report, ledger, budget, gate });
       this.detectGate();
       this.emit("change");

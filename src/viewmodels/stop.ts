@@ -55,3 +55,48 @@ export function planStopWatching(state: LocalRunState): StopPlan {
     detachWatch: state.watching
   };
 }
+
+/** The outcome of executing a cancel plan (what actually happened). */
+export interface CancelOutcome {
+  /** The engine confirmed the terminal stop (`collab run stop` succeeded). */
+  engineStopped: boolean;
+  /** Present when the engine stop was ATTEMPTED but failed — the error message. */
+  error?: string;
+  /** The managed orchestrate child was actually SIGTERM'd. */
+  killedChild: boolean;
+}
+
+/** A user-facing message + its severity, chosen purely from the cancel outcome. */
+export interface CancelMessage {
+  kind: "info" | "error";
+  text: string;
+}
+
+/**
+ * Pick the honest cancel message. Success ("terminally stopped, won't resume") is
+ * shown ONLY when the engine actually confirmed the stop. If the engine stop failed,
+ * surface an ERROR — and if the local driver was still killed, say so AND warn the run
+ * may resume (the engine still holds it resumable). Keeping this pure means the
+ * message-selection is unit-tested without vscode.
+ */
+export function cancelRunMessage(run: string, outcome: CancelOutcome): CancelMessage {
+  if (outcome.engineStopped) {
+    return {
+      kind: "info",
+      text: `Conclave: stopped "${run}" — engine marked it terminally stopped (won't resume)${
+        outcome.killedChild ? "; driving child terminated" : ""
+      }.`
+    };
+  }
+  const detail = outcome.error ? ` (${outcome.error})` : "";
+  if (outcome.killedChild) {
+    return {
+      kind: "error",
+      text: `Conclave: local driver for "${run}" was terminated, but the engine stop FAILED${detail} — the run may resume. Retry Stop.`
+    };
+  }
+  return {
+    kind: "error",
+    text: `Conclave: failed to stop "${run}"${detail}. The run was not stopped — retry.`
+  };
+}

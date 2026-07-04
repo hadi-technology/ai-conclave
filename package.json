@@ -173,6 +173,12 @@
         "title": "Take over seat",
         "category": "Conclave",
         "icon": "$(terminal)"
+      },
+      {
+        "command": "conclave.releaseSeat",
+        "title": "Release seat (resume headless)",
+        "category": "Conclave",
+        "icon": "$(debug-continue)"
       }
     ],
     "menus": {
@@ -206,9 +212,19 @@
           "command": "conclave.takeoverSeat",
           "when": "view == conclave.seatsView",
           "group": "navigation@1"
+        },
+        {
+          "command": "conclave.releaseSeat",
+          "when": "view == conclave.seatsView",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
+        {
+          "command": "conclave.takeoverSeat",
+          "when": "view == conclave.seatsView && viewItem =~ /conclaveSeat/",
+          "group": "inline@1"
+        },
         {
           "command": "conclave.driveRun",
           "when": "view == conclave.runsView && viewItem =~ /conclaveRun/",

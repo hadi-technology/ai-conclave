@@ -27,8 +27,8 @@ afterAll(() => {
 describe("EngineClient — typed read envelopes", () => {
   it("version() parses the compatibility payload (schema-agnostic)", async () => {
     const v = await client.version();
-    // Do NOT hardcode schemaVersion — it is a monotonic feature level that advances
-    // additively (engine is at 2, may go higher). Assert the compatibility invariant
+    // Do NOT hardcode the engine's schemaVersion — it is a monotonic feature level
+    // that advances additively (may go higher). Assert the compatibility invariant
     // holds dynamically instead: minClientSchema <= CLIENT_SCHEMA_VERSION <= schemaVersion.
     expect(typeof v.schemaVersion).toBe("number");
     expect(typeof v.minClientSchema).toBe("number");
@@ -36,6 +36,10 @@ describe("EngineClient — typed read envelopes", () => {
     expect(v.schemaVersion).toBeGreaterThanOrEqual(v.minClientSchema);
     expect(v.minClientSchema).toBeLessThanOrEqual(CLIENT_SCHEMA_VERSION);
     expect(CLIENT_SCHEMA_VERSION).toBeLessThanOrEqual(v.schemaVersion);
+    // The extension DOES require schema 3 (it calls `seat pause/resume` + `run stop`),
+    // so it must advertise 3 — not 1 — or an older engine would pass provisioning and
+    // then fail at runtime. Pin it so an accidental downgrade fails fast here.
+    expect(CLIENT_SCHEMA_VERSION).toBe(3);
   });
 
   it("runs() lists the seeded run", async () => {

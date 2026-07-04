@@ -5,7 +5,22 @@
  */
 import { join, resolve } from "node:path";
 
-import type { StartRunOptions } from "../engine/client.js";
+import type { EngineClient, StartRunOptions } from "../engine/client.js";
+
+/**
+ * Discover seats by ASKING THE ENGINE which adapters it can load (thin client — no
+ * filesystem reach-around into the engine's adapters dir). Returns the sorted seat
+ * names, or an empty list on any engine error so the start flow degrades to
+ * free-text seat entry instead of crashing. vscode-free → unit-testable headlessly.
+ */
+export async function discoverSeats(client: EngineClient): Promise<string[]> {
+  try {
+    const res = await client.adapters();
+    return res.adapters.map((a) => a.name).sort();
+  } catch {
+    return [];
+  }
+}
 
 export interface StartRunInputs {
   goal: string;

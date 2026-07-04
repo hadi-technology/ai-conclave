@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { planCancelRun, planStopWatching } from "../src/viewmodels/stop.js";
+import { cancelRunMessage, planCancelRun, planStopWatching } from "../src/viewmodels/stop.js";
 
 describe("planCancelRun — engine-side terminal cancel", () => {
   it("always asks the engine to stop, and kills the child when driving", () => {
@@ -58,6 +58,37 @@ describe("planStopWatching — detach the viewer only", () => {
     const plan = planStopWatching({ driving: true, watching: true });
     expect(plan.engineStop).toBe(false);
     expect(plan.killOrchestrate).toBe(false);
+  });
+});
+
+describe("cancelRunMessage — honest reporting of the cancel outcome (FIX #4)", () => {
+  it("engine confirmed the stop → info 'terminally stopped'", () => {
+    const m = cancelRunMessage("frost", { engineStopped: true, killedChild: false });
+    expect(m.kind).toBe("info");
+    expect(m.text).toContain("terminally stopped");
+    expect(m.text).not.toContain("driving child terminated");
+  });
+
+  it("engine confirmed + child killed → info notes the child was terminated", () => {
+    const m = cancelRunMessage("frost", { engineStopped: true, killedChild: true });
+    expect(m.kind).toBe("info");
+    expect(m.text).toContain("driving child terminated");
+  });
+
+  it("engine stop FAILED, no child → error, does NOT claim stopped", () => {
+    const m = cancelRunMessage("frost", { engineStopped: false, killedChild: false, error: "boom" });
+    expect(m.kind).toBe("error");
+    expect(m.text).toContain("failed to stop");
+    expect(m.text).toContain("boom");
+    expect(m.text).not.toContain("terminally stopped");
+  });
+
+  it("engine stop FAILED but child was killed → error warns the run may resume", () => {
+    const m = cancelRunMessage("frost", { engineStopped: false, killedChild: true, error: "timeout" });
+    expect(m.kind).toBe("error");
+    expect(m.text).toContain("local driver");
+    expect(m.text).toContain("may resume");
+    expect(m.text).toContain("timeout");
   });
 });
 

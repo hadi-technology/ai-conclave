@@ -14,7 +14,7 @@ import {
   type SnapshotState
 } from "../src/viewmodels/model.js";
 import { runsTree } from "../src/viewmodels/runs.js";
-import { seatsTree, seatChip } from "../src/viewmodels/seats.js";
+import { seatsTree, seatChip, seatArgOf } from "../src/viewmodels/seats.js";
 import { boardTree, groupUnits, unitColumn, BOARD_COLUMNS } from "../src/viewmodels/board.js";
 import { ledgerTree } from "../src/viewmodels/ledger.js";
 import { statusBarModel } from "../src/viewmodels/statusbar.js";
@@ -216,6 +216,24 @@ describe("seatsTree + seatChip", () => {
     expect(a.description).toContain("capped");
     expect(a.description).toContain("cheap");
     expect(a.contextValue).toBe("conclaveSeatCapped");
+  });
+
+  it("seat nodes carry their seat name (for seat-scoped commands like takeover)", () => {
+    const m = modelFromSnapshot(SNAPSHOT);
+    const nodes = seatsTree(m.seats);
+    expect(nodes[0].seat).toBe("a");
+    expect(nodes[1].seat).toBe("b");
+  });
+
+  it("seatArgOf extracts the seat from a string, a {seat}, a tree node, or nothing (FIX #2)", () => {
+    expect(seatArgOf("claude")).toBe("claude");
+    expect(seatArgOf({ seat: "glm" })).toBe("glm");
+    // The Seats tree passes its node; seat wins, else label = seat name.
+    expect(seatArgOf({ key: "seat.codex", label: "codex" })).toBe("codex");
+    expect(seatArgOf({ seat: "claude", label: "ignored" })).toBe("claude");
+    expect(seatArgOf(undefined)).toBeUndefined();
+    expect(seatArgOf({})).toBeUndefined();
+    expect(seatArgOf(42)).toBeUndefined();
   });
 
   it("seatChip reflects capped/working/idle/paused", () => {

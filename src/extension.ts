@@ -23,9 +23,10 @@ import { registerCommands, openReportForRun } from "./commands.js";
 import { CockpitPanel } from "./cockpit.js";
 import { FindingsManager } from "./findings.js";
 import { reviewUnit, openIntegrationDiff, revealBuildTarget } from "./diffReview.js";
-import { takeoverSeat } from "./takeover.js";
+import { takeoverSeat, releaseSeatCommand, initTakeover, disposeAllTakeovers } from "./takeover.js";
 import { emptyModel, type RunModel } from "./viewmodels/model.js";
-import { planCancelRun, planStopWatching } from "./viewmodels/stop.js";
+import { seatArgOf } from "./viewmodels/seats.js";
+import { planCancelRun, planStopWatching, type CancelOutcome } from "./viewmodels/stop.js";
 import { planBuildTarget } from "./viewmodels/startRun.js";
 import { prepareBuildTarget } from "./buildTarget.js";
 import { scratchRoot } from "./startRunFlow.js";
@@ -35,8 +36,6 @@ import type { RunSummary } from "./engine/contract.js";
 /** Shared context handed to command handlers. */
 export interface ConclaveContext {
   readonly output: vscode.OutputChannel;
-  /** Live watch attachments, keyed by run ref — so Stop watching can detach them. */
-  readonly watchers: Map<string, WatchClient>;
   /** Managed orchestrate children, keyed by run ref — so Stop tears them down. */
   readonly orchestrators: Map<string, OrchestrateController>;
   /** Build targets (the fleet's scratch clone) per run ref — populated when a run
@@ -65,13 +64,21 @@ export interface ConclaveContext {
    *  build dir (from the start-run flow); when absent, a safe one is resolved. */
   driveRun(runRef: string, opts?: { fullAuto?: boolean; target?: string }): Promise<void>;
   /** CANCEL a run: engine-side terminal stop (`collab run stop`, so a resume never
-   *  re-drives it) + SIGTERM the managed orchestrate child. Leaves the viewer. */
-  cancelRun(runRef: string): Promise<void>;
+   *  re-drives it) + SIGTERM the managed orchestrate child. Leaves the viewer.
+   *  Returns the ACTUAL outcome so callers report honestly (the engine stop can
+   *  fail even when the local child was killed). Fire-and-forget callers ignore it. */
+  cancelRun(runRef: string): Promise<CancelOutcome>;
   /** Detach the live watch viewer only — the run (and any driving) keeps going. */
   stopWatching(runRef: string): void;
+  /** Whether the StateBus live watch feed is currently attached to `runRef`. */
+  isWatching(runRef: string): boolean;
 }
 
 let cachedProvision: { signature: string; result: ProvisionResult } | undefined;
+
+/** Captured at activate so `deactivate()` (which gets no context handle) can drain
+ *  active takeovers on shutdown — see {@link disposeAllTakeovers}. */
+let activeCtx: ConclaveContext | undefined;
 
 function readEngineConfig(): EngineConfig {
   const cfg = vscode.workspace.getConfiguration("conclave");
@@ -120,7 +127,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Conclave");
   context.subscriptions.push(output);
 
-  const watchers = new Map<string, WatchClient>();
   const orchestrators = new Map<string, OrchestrateController>();
   const targets = new Map<string, string>();
 
@@ -170,9 +176,8 @@ export function activate(context: vscode.ExtensionContext): void {
           runRef,
           log: (l) => output.appendLine(`[gate] ${l}`),
           openReport: (r) => openReportForRun(ctx, r),
-          stop: (r) => {
-            void cancelRun(r);
-          }
+          stop: (r) => cancelRun(r),
+          resume: (r) => orchestrators.get(r)?.resume()
         });
       });
       bus = b;
@@ -250,45 +255,46 @@ export function activate(context: vscode.ExtensionContext): void {
    *  Per {@link planCancelRun}: always asks the engine (idempotent, works for
    *  attached-only runs); kills the child only when we're driving; leaves the
    *  viewer attached so the user watches it wind down. */
-  async function cancelRun(runRef: string): Promise<void> {
-    const plan = planCancelRun({ driving: orchestrators.has(runRef), watching: watchers.has(runRef) });
+  async function cancelRun(runRef: string): Promise<CancelOutcome> {
+    const plan = planCancelRun({ driving: orchestrators.has(runRef), watching: bus?.isWatching(runRef) ?? false });
+    let engineStopped = false;
+    let error: string | undefined;
     if (plan.engineStop) {
       try {
         const client = new EngineClient(await resolveClientConfig());
         const res = await client.runStop(runRef);
+        engineStopped = true;
         output.appendLine(`[conclave] engine marked "${runRef}" ${res.status} (won't resume).`);
       } catch (err) {
-        output.appendLine(
-          `[conclave] engine run stop for "${runRef}" failed: ${err instanceof Error ? err.message : String(err)}`
-        );
+        error = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[conclave] engine run stop for "${runRef}" failed: ${error}`);
       }
     }
+    let killedChild = false;
     if (plan.killOrchestrate) {
       const controller = orchestrators.get(runRef);
       if (controller) {
         controller.stop();
         orchestrators.delete(runRef);
+        killedChild = true;
         output.appendLine(`[conclave] stopped driving "${runRef}" (SIGTERM).`);
       }
     }
+    return { engineStopped, error, killedChild };
   }
 
-  /** Detach the live watch viewer only (per {@link planStopWatching}). */
+  /** Detach the live watch viewer only (per {@link planStopWatching}). The
+   *  StateBus owns the single live feed, so it's the authority for detach. */
   function stopWatching(runRef: string): void {
-    const plan = planStopWatching({ driving: orchestrators.has(runRef), watching: watchers.has(runRef) });
+    const plan = planStopWatching({ driving: orchestrators.has(runRef), watching: bus?.isWatching(runRef) ?? false });
     if (plan.detachWatch) {
-      const w = watchers.get(runRef);
-      if (w) {
-        w.stop();
-        watchers.delete(runRef);
-        output.appendLine(`[conclave] detached live watch for "${runRef}".`);
-      }
+      const was = bus?.detach(runRef) ?? false;
+      if (was) output.appendLine(`[conclave] detached live watch for "${runRef}".`);
     }
   }
 
   const ctx: ConclaveContext = {
     output,
-    watchers,
     orchestrators,
     targets,
     buildTargetFor,
@@ -300,8 +306,11 @@ export function activate(context: vscode.ExtensionContext): void {
     focusRun,
     driveRun,
     cancelRun,
-    stopWatching
+    stopWatching,
+    isWatching: (runRef) => bus?.isWatching(runRef) ?? false
   };
+  // Capture for deactivate()'s takeover drain (it has no context parameter).
+  activeCtx = ctx;
 
   // ── Views + status bar ───────────────────────────────────────────────────────
   const viewData: ViewData = {
@@ -377,7 +386,24 @@ export function activate(context: vscode.ExtensionContext): void {
   e4("conclave.reviewUnit", (run) => reviewUnit(ctx, run));
   e4("conclave.openIntegrationDiff", (run) => openIntegrationDiff(ctx, run));
   e4("conclave.revealBuildTarget", (run) => revealBuildTarget(ctx, run));
-  e4("conclave.takeoverSeat", () => takeoverSeat(ctx));
+  // Pass the seat clicked in the Seats tree through to takeover (the tree item's
+  // node carries `seat`/`label`); no arg → falls back to the seat picker.
+  e4("conclave.takeoverSeat", (_run, arg) => takeoverSeat(ctx, seatArgOf(arg)));
+
+  // Takeover release wiring: resume headless when a tracked takeover terminal closes.
+  initTakeover(ctx, context.subscriptions);
+  // Shutdown drain: release any active takeovers on dispose so no seat is left with
+  // its engine pause flag stuck set (also called from deactivate()).
+  context.subscriptions.push({ dispose: () => void disposeAllTakeovers(ctx) });
+  context.subscriptions.push(
+    vscode.commands.registerCommand("conclave.releaseSeat", (arg?: unknown) =>
+      releaseSeatCommand(ctx, typeof arg === "string" ? arg : undefined).catch((err) => {
+        const shown = err instanceof EngineError ? err.toDisplay() : err instanceof Error ? err.message : String(err);
+        output.appendLine(`[conclave] releaseSeat failed: ${shown}`);
+        void vscode.window.showErrorMessage(`Conclave: ${shown}`);
+      })
+    )
+  );
 
   // Keep the Problems panel in sync as findings change on the watch feed (throttled).
   let findingsRefreshAt = 0;
@@ -394,8 +420,6 @@ export function activate(context: vscode.ExtensionContext): void {
     dispose: () => {
       for (const c of orchestrators.values()) c.stop();
       orchestrators.clear();
-      for (const w of watchers.values()) w.stop();
-      watchers.clear();
       bus?.dispose();
     }
   });
@@ -403,6 +427,10 @@ export function activate(context: vscode.ExtensionContext): void {
   output.appendLine("[conclave] activated.");
 }
 
-export function deactivate(): void {
-  // Watchers/orchestrators/bus are torn down via subscriptions.
+export function deactivate(): Promise<void> | undefined {
+  // Watchers/orchestrators/bus are torn down via subscriptions. Additionally release
+  // any active takeovers so a seat is never left with its engine pause flag stuck set
+  // across a reload/disable. VS Code awaits a returned Promise (bounded — the drain is
+  // best-effort and the client carries its own spawn timeout).
+  return activeCtx ? disposeAllTakeovers(activeCtx) : undefined;
 }

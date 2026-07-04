@@ -1,43 +1,94 @@
 /**
- * Takeover hatch — the vscode shell (E4, item 4). HONEST implementation.
+ * Takeover hatch — the vscode shell (E4, item 4). REAL one-click round-trip.
  *
- * The JSON contract exposes each seat's `session` (watch snapshot
- * `state.seats[].session`) and `paused` flag, so Conclave can build the exact
- * interactive resume command — but it has NO action to SET the pause flag or run
- * the round-trip (the engine's real takeover is in-process store-only). So this
- * command opens an integrated Terminal in the build target, echoes a clear
- * explanation + the contract gap, and STAGES the real `<cli> --resume <session>`
- * on the prompt (does not auto-run it, and warns about double-attach if the seat
- * is mid-turn). The precise engine additions needed for a true one-click
- * pause→resume→release round-trip are recorded in docs/ENGINE-GAPS.md.
+ * The engine ships `collab seat pause/resume` (schema 3), so the contract gap is
+ * CLOSED. Flow:
+ *   Take over seat → `engine.pauseSeat(seat, run)` → engine SETS the pause flag,
+ *   WAITS until the seat is idle, and returns the authoritative resume spec
+ *   (session / sessionCwd / resumeCommand / resumeArgs / ready:true) → open an
+ *   integrated terminal in `sessionCwd` and AUTO-RUN `resumeCommand resumeArgs`
+ *   (safe: the engine guarantees paused+idle) → the user drives by hand → Release
+ *   (button OR closing the terminal) → `engine.resumeSeat(seat, run)` → headless
+ *   driving resumes.
  *
- * Pure command construction + gap detection lives in src/viewmodels/takeover.ts
- * (unit-tested); this file only reads the adapter command off disk and drives the
- * Terminal API.
+ * On pause failure the engine ATOMIC-FAILS (clears its own pause flag), so the
+ * shell surfaces the message + hint and does NOTHING else — no cleanup.
+ *
+ * Pure decision logic (plan/guard) lives in src/viewmodels/takeover.ts.
  */
 import * as vscode from "vscode";
-import { readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
 
 import type { ConclaveContext } from "./extension.js";
-import { seatTakeoverState, buildTakeoverPlan } from "./viewmodels/takeover.js";
+import { EngineClient } from "./engine/client.js";
+import { planTakeover, releaseTracked, drainTakeovers } from "./viewmodels/takeover.js";
 
-/** Read the `command` field out of a seat's adapter JSON, or null if unreadable. */
-function adapterCommand(adaptersDir: string | undefined, cwd: string, seat: string): string | null {
-  const base = adaptersDir?.trim() || join(cwd, "adapters");
-  const path = base.endsWith(".json") ? base : join(isAbsolute(base) ? base : join(cwd, base), `${seat}.json`);
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as { command?: unknown };
-    return typeof parsed.command === "string" ? parsed.command : null;
-  } catch {
-    return null;
+/** A live takeover: which terminal is attached and which run it belongs to. */
+interface ActiveTakeover {
+  terminal: vscode.Terminal;
+  run: string;
+  /** In-flight guard for releaseTracked — set while a resume is being awaited so
+   *  the button + on-close double-fire is suppressed, cleared if resume fails. */
+  releasing?: boolean;
+}
+
+/** Tracked takeovers keyed by seat — so we know which seat a terminal belongs to
+ *  and never double-resume. Module-level: shared across command invocations. */
+const activeTakeovers = new Map<string, ActiveTakeover>();
+
+/** Seats with a takeover in flight (paused-request sent, not yet tracked in
+ *  `activeTakeovers`). Reserved BEFORE the async `pauseSeat` so two rapid
+ *  invocations for the same seat can't both pause + attach (the second is
+ *  rejected as "already taking over"). */
+const pendingTakeovers = new Set<string>();
+
+let listenerRegistered = false;
+
+/**
+ * Register the terminal-close listener ONCE (called from extension activate). When
+ * a tracked takeover terminal closes, resume the seat headless (release on-close).
+ */
+export function initTakeover(ctx: ConclaveContext, subscriptions: vscode.Disposable[]): void {
+  if (listenerRegistered) return;
+  listenerRegistered = true;
+  subscriptions.push(
+    vscode.window.onDidCloseTerminal((term) => {
+      for (const [seat, active] of activeTakeovers) {
+        if (active.terminal === term) {
+          void release(ctx, seat, "terminal closed");
+          break;
+        }
+      }
+    })
+  );
+}
+
+/** Resume a tracked seat exactly once (guards button + on-close double-fire).
+ *  Returns true iff the seat was actually resumed — callers dispose the terminal
+ *  ONLY on true, so a failed resume keeps the terminal open (and the entry
+ *  tracked, per releaseTracked) for a retry. */
+async function release(ctx: ConclaveContext, seat: string, reason: string): Promise<boolean> {
+  const client = new EngineClient(await ctx.resolveClientConfig());
+  const released = await releaseTracked(activeTakeovers, seat, async (s, run) => {
+    const res = await client.resumeSeat(s, run);
+    if (!res.ok) {
+      throw new Error(res.error.message + (res.error.hint ? ` — ${res.error.hint}` : ""));
+    }
+  }).catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    ctx.output.appendLine(`[takeover] resume seat "${seat}" failed (${reason}): ${msg}`);
+    void vscode.window.showErrorMessage(`Conclave: failed to resume seat "${seat}" — ${msg}`);
+    return false;
+  });
+  if (released) {
+    ctx.output.appendLine(`[takeover] seat "${seat}" released (${reason}) — headless driving resumed.`);
+    void vscode.window.showInformationMessage(`Conclave: seat "${seat}" released — headless driving resumed.`);
   }
+  return released;
 }
 
 /**
- * Take over a seat. Reads the seat's session/paused/status from the active run's
- * watch snapshot, builds the honest takeover plan, and opens an integrated
- * terminal in the build target with the plan's banner + staged resume command.
+ * Take over a seat: pause it engine-side (the engine waits until it's idle), then
+ * open a terminal in its worktree already attached via the returned resume spec.
  */
 export async function takeoverSeat(ctx: ConclaveContext, seatArg?: string): Promise<void> {
   const bus = await ctx.ensureBus();
@@ -61,41 +112,130 @@ export async function takeoverSeat(ctx: ConclaveContext, seatArg?: string): Prom
     if (!seat) return;
   }
 
-  const st = seatTakeoverState(snapshot, seat);
-  const clientConfig = await ctx.resolveClientConfig();
-  const cwd = ctx.buildTargetFor(run);
-  const cmd = adapterCommand(clientConfig.adaptersDir, clientConfig.cwd, seat);
-
-  const plan = buildTakeoverPlan({
-    seat,
-    session: st?.session ?? null,
-    working: st?.status === "working",
-    adapterCommand: cmd,
-    targetCwd: cwd
-  });
-
-  const terminal = vscode.window.createTerminal({ name: `Conclave takeover · ${seat}`, cwd });
-  terminal.show();
-  // Echo the banner as comments so it survives on the prompt without executing.
-  for (const line of plan.banner) {
-    terminal.sendText(line ? `# ${line}` : "", true);
+  // Already taken over (or a pause is in flight) → focus / no-op instead of
+  // pausing twice. The pending check closes the race where two rapid invocations
+  // both pass the activeTakeovers check before either has set() its entry.
+  const existing = activeTakeovers.get(seat);
+  if (existing) {
+    existing.terminal.show();
+    vscode.window.showInformationMessage(`Conclave: already driving seat "${seat}" — focused its terminal.`);
+    return;
   }
-  if (plan.kind === "resume") {
-    // Stage the real command WITHOUT executing — the user reviews then presses Enter.
-    terminal.sendText(plan.resumeCommand, false);
-    if (plan.warnDoubleAttach) {
-      void vscode.window.showWarningMessage(
-        `Conclave: staged "${plan.resumeCommand}" for seat "${seat}". WARNING: seat is mid-turn — wait until idle before pressing Enter. Conclave can't pause it (contract gap).`
-      );
-    } else {
-      void vscode.window.showInformationMessage(
-        `Conclave: staged "${plan.resumeCommand}" for seat "${seat}" in the terminal. Review, then press Enter to attach. Conclave can't auto-pause the harness (contract gap — see docs/ENGINE-GAPS.md).`
-      );
+  if (pendingTakeovers.has(seat)) {
+    vscode.window.showInformationMessage(`Conclave: already taking over seat "${seat}" — waiting for it to go idle…`);
+    return;
+  }
+
+  // NO snapshot preflight: `lastSnapshot` only refreshes on the INITIAL watch
+  // snapshot, so a seat that gained its session AFTER attach would be wrongly
+  // refused. The engine's `pauseSeat` is authoritative — it atomic-fails with a
+  // clear "no session yet" envelope, which planTakeover surfaces below. Relying
+  // on it (not a possibly-stale snapshot) is both correct and simpler.
+  const clientConfig = await ctx.resolveClientConfig();
+  const client = new EngineClient(clientConfig);
+  ctx.output.appendLine(`[takeover] pausing seat "${seat}" on "${run}" (waiting for it to go idle)…`);
+
+  // Reserve BEFORE the async pause so a concurrent invocation is rejected above.
+  pendingTakeovers.add(seat);
+  let terminal: vscode.Terminal;
+  try {
+    const res = await client.pauseSeat(seat, run, { adaptersDir: clientConfig.adaptersDir });
+    const effect = planTakeover(seat, res);
+    if (effect.kind === "error") {
+      // Engine atomic-fails (clears its own pause flag) — surface + return, no cleanup.
+      vscode.window.showErrorMessage(effect.message);
+      ctx.output.appendLine(`[takeover] pause seat "${seat}" failed: ${effect.message}`);
+      return;
     }
-  } else {
-    vscode.window.showWarningMessage(
-      `Conclave: can't stage a takeover for "${seat}" (${plan.kind}). See the terminal + docs/ENGINE-GAPS.md.`
+    terminal = vscode.window.createTerminal({ name: `Conclave takeover · ${seat}`, cwd: effect.cwd });
+    // Auto-run: the engine guarantees the seat is paused AND idle (ready:true), so
+    // attaching now is safe (no double-attach).
+    terminal.sendText(effect.commandLine, true);
+    terminal.show();
+    activeTakeovers.set(seat, { terminal, run });
+    ctx.output.appendLine(
+      `[takeover] seat "${seat}" paused; attached "${effect.commandLine}" in ${effect.cwd} (session ${effect.session}).`
+    );
+  } finally {
+    // Once tracked in activeTakeovers (or bailed), drop the reservation so the
+    // long "Release" prompt below doesn't hold it — the activeTakeovers entry
+    // now guards re-entry.
+    pendingTakeovers.delete(seat);
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    `Conclave: took over seat "${seat}" — you're driving it in the terminal. Close the terminal or click Release to resume headless driving.`,
+    "Release seat"
+  );
+  if (choice === "Release seat") {
+    // Dispose ONLY on a successful release — a failed resume keeps the terminal
+    // open + the entry tracked so the user can retry (close it, or click again).
+    if (await release(ctx, seat, "release button")) terminal.dispose();
+  }
+}
+
+/**
+ * Shutdown drain (extension deactivate / window reload / disable): best-effort release
+ * of EVERY active takeover, so a seat is never left with its engine pause flag stuck
+ * set indefinitely. Bounded + never throws: each resume failure is logged, the
+ * registry (and its terminal refs) is cleared regardless, and any attached terminals
+ * are disposed. Safe to call with nothing tracked (no-op).
+ */
+export async function disposeAllTakeovers(ctx: ConclaveContext): Promise<void> {
+  if (activeTakeovers.size === 0) return;
+  // Snapshot terminals BEFORE draining (drainTakeovers clears the registry).
+  const terminals = [...activeTakeovers.values()].map((a) => a.terminal);
+  let client: EngineClient | undefined;
+  try {
+    client = new EngineClient(await ctx.resolveClientConfig());
+  } catch (err) {
+    ctx.output.appendLine(
+      `[takeover] shutdown drain: could not resolve engine client — ${err instanceof Error ? err.message : String(err)}`
     );
   }
-  ctx.output.appendLine(`[takeover] seat "${seat}" on "${run}": ${plan.kind} (target ${cwd}).`);
+  if (client) {
+    const engine = client;
+    await drainTakeovers(
+      activeTakeovers,
+      async (seat, run) => {
+        const res = await engine.resumeSeat(seat, run);
+        if (!res.ok) throw new Error(res.error.message);
+      },
+      (seat, err) =>
+        ctx.output.appendLine(
+          `[takeover] shutdown resume seat "${seat}" failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+    );
+  } else {
+    // No client to resume with — still clear so we don't leak references.
+    activeTakeovers.clear();
+  }
+  for (const t of terminals) {
+    try {
+      t.dispose();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * `conclave.releaseSeat` — release a tracked takeover (resume headless). Picks when
+ * multiple seats are taken over. Disposing the terminal after release is a no-op on
+ * the on-close listener (the registry entry is already gone).
+ */
+export async function releaseSeatCommand(ctx: ConclaveContext, seatArg?: string): Promise<void> {
+  const seats = [...activeTakeovers.keys()];
+  if (seats.length === 0) {
+    vscode.window.showInformationMessage("Conclave: no seat is currently taken over.");
+    return;
+  }
+  let seat = seatArg && activeTakeovers.has(seatArg) ? seatArg : undefined;
+  if (!seat) {
+    seat = seats.length === 1 ? seats[0] : await vscode.window.showQuickPick(seats, { placeHolder: "Release which seat?" });
+  }
+  if (!seat || !activeTakeovers.has(seat)) return;
+  const terminal = activeTakeovers.get(seat)!.terminal;
+  // Dispose only on a successful release — keep the terminal open on failure.
+  if (await release(ctx, seat, "release command")) terminal.dispose();
 }

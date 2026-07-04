@@ -11,10 +11,10 @@ import type { ConclaveContext } from "./extension.js";
 import { EngineError } from "./engine/errors.js";
 import type { EngineClient } from "./engine/client.js";
 import type { RunSummary } from "./engine/contract.js";
-import { WatchClient } from "./engine/watch.js";
 import { runStartFlow } from "./startRunFlow.js";
 import { presentGate } from "./gates.js";
 import { gateFromRead } from "./viewmodels/model.js";
+import { cancelRunMessage } from "./viewmodels/stop.js";
 
 export function registerCommands(context: vscode.ExtensionContext, ctx: ConclaveContext): void {
   const reg = (id: string, fn: (arg?: unknown) => Promise<void>) =>
@@ -235,9 +235,7 @@ async function resolveGate(ctx: ConclaveContext): Promise<void> {
     runRef: run,
     log: (l) => ctx.output.appendLine(`[gate] ${l}`),
     openReport: (r) => openReportForRun(ctx, r),
-    stop: (r) => {
-      void ctx.cancelRun(r);
-    }
+    stop: (r) => ctx.cancelRun(r)
   });
 }
 
@@ -246,18 +244,21 @@ async function resolveGate(ctx: ConclaveContext): Promise<void> {
 async function cancelRunCmd(ctx: ConclaveContext, arg: unknown): Promise<void> {
   const client = await ctx.resolveClient();
   const run = argRunRef(arg) ?? (await pickRun(client, "Stop (cancel) which run?"));
-  const driving = ctx.orchestrators.has(run);
-  await ctx.cancelRun(run);
-  vscode.window.showInformationMessage(
-    `Conclave: stopped "${run}" — engine marked it terminally stopped (won't resume)${driving ? "; driving child terminated" : ""}.`
-  );
+  const outcome = await ctx.cancelRun(run);
+  // Honest reporting: only claim "terminally stopped" when the engine confirmed it.
+  const msg = cancelRunMessage(run, outcome);
+  if (msg.kind === "info") {
+    vscode.window.showInformationMessage(msg.text);
+  } else {
+    vscode.window.showErrorMessage(msg.text);
+  }
 }
 
 /** STOP WATCHING: detach the live viewer only. The run keeps running. */
 async function stopWatchingCmd(ctx: ConclaveContext, arg: unknown): Promise<void> {
   const client = await ctx.resolveClient();
   const run = argRunRef(arg) ?? (await pickRun(client, "Stop watching which run?"));
-  const watching = ctx.watchers.has(run);
+  const watching = ctx.isWatching(run);
   ctx.stopWatching(run);
   if (watching) {
     vscode.window.showInformationMessage(`Conclave: stopped watching "${run}" (viewer detached; the run keeps running).`);
@@ -270,23 +271,15 @@ async function attachRun(ctx: ConclaveContext): Promise<void> {
   const client = await ctx.resolveClient();
   const run = await pickRun(client, "Attach (watch-only) to which run?");
 
-  if (ctx.watchers.has(run)) {
+  if (ctx.isWatching(run)) {
     vscode.window.showInformationMessage(`Conclave: already attached to "${run}".`);
     return;
   }
-  const clientConfig = await ctx.resolveClientConfig();
-  const watcher = new WatchClient(clientConfig, { run });
-  watcher.on("event", (line) => ctx.output.appendLine(`[watch ${run}] event @${line.cursor} ${line.event.type}`));
-  watcher.on("stream", (line) => ctx.output.appendLine(`[watch ${run}] ${line.seat}> ${line.line}`));
-  watcher.on("close", (info) => {
-    ctx.output.appendLine(`[watch ${run}] closed (${info.stopped ? "detached" : "ended"}, code ${info.code}).`);
-    ctx.watchers.delete(run);
-  });
-  watcher.start();
-  ctx.watchers.set(run, watcher);
-  ctx.output.show(true);
-  // Also focus it in the sidebar so its board/ledger populate.
+  // The StateBus owns the single live feed: focusRun attaches its watch and
+  // populates the sidebar (board/ledger). No separate WatchClient here — a second
+  // one would double-watch the same run.
   await ctx.focusRun(run);
+  ctx.output.show(true);
   vscode.window.showInformationMessage(`Conclave: attached to "${run}". Live events stream to the sidebar + output.`);
 }
 

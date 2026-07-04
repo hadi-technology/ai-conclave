@@ -7,7 +7,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { gateFromRead } from "../src/viewmodels/model.js";
-import { gateNotificationSpec, resolveGateCall, type GateResolution } from "../src/viewmodels/gate.js";
+import {
+  gateNotificationSpec,
+  gateStillPending,
+  resolveGateCall,
+  resolutionClearsGate,
+  type GateResolution
+} from "../src/viewmodels/gate.js";
+import { cancelRunMessage, type CancelOutcome } from "../src/viewmodels/stop.js";
 import type { GateShow, BudgetShow } from "../src/engine/contract.js";
 
 /** A fake EngineClient capturing gate/budget calls. */
@@ -19,8 +26,15 @@ function fakeClient() {
   };
 }
 
-/** The same dispatch the vscode layer performs, minus vscode. */
-async function dispatch(client: ReturnType<typeof fakeClient>, res: GateResolution): Promise<void> {
+/** The same dispatch the vscode layer performs, minus vscode. Mirrors
+ *  dispatchResolution (src/gates.ts): fire the `resume` hook after a
+ *  gate-CLEARING action, using the SAME `resolutionClearsGate` predicate the
+ *  real code uses. */
+async function dispatch(
+  client: ReturnType<typeof fakeClient>,
+  res: GateResolution,
+  resume?: (runRef: string) => void
+): Promise<void> {
   switch (res.method) {
     case "gateApprove":
       await client.gateApprove(res.opts);
@@ -34,6 +48,7 @@ async function dispatch(client: ReturnType<typeof fakeClient>, res: GateResoluti
     default:
       break;
   }
+  if (resolutionClearsGate(res.method)) resume?.("frost");
 }
 
 describe("pending gate → client call", () => {
@@ -86,5 +101,80 @@ describe("pending gate → client call", () => {
     const client = fakeClient();
     await dispatch(client, res);
     expect(client.budgetRaise).toHaveBeenCalledWith({ run: "frost", toUsd: 10 });
+  });
+});
+
+describe("gateStillPending — stale-notification TOCTOU guard (FIX #3)", () => {
+  it("true when the still-pending gate id matches the acted-on id", () => {
+    const current: GateShow = { schemaVersion: 1, run: "frost", id: 1, gate: { id: 7, kind: "plan_approval", status: "pending" } };
+    expect(gateStillPending(7, current)).toBe(true);
+  });
+
+  it("false when the run advanced to a DIFFERENT gate id", () => {
+    const current: GateShow = { schemaVersion: 1, run: "frost", id: 1, gate: { id: 8, kind: "decide_tie", status: "pending" } };
+    expect(gateStillPending(7, current)).toBe(false);
+  });
+
+  it("false when no gate is pending now", () => {
+    const current: GateShow = { schemaVersion: 1, run: "frost", id: 1, gate: null };
+    expect(gateStillPending(7, current)).toBe(false);
+    expect(gateStillPending(7, null)).toBe(false);
+  });
+});
+
+describe("dispatchResolution → re-spawns the orchestrate child on a gate-clearing action", () => {
+  it("resolutionClearsGate is true for the 3 gate-clearing methods, false for openReport/stop", () => {
+    expect(resolutionClearsGate("gateApprove")).toBe(true);
+    expect(resolutionClearsGate("gateReject")).toBe(true);
+    expect(resolutionClearsGate("budgetRaise")).toBe(true);
+    expect(resolutionClearsGate("openReport")).toBe(false);
+    expect(resolutionClearsGate("stop")).toBe(false);
+  });
+
+  it("approve / reject / budgetRaise each invoke resume exactly once", async () => {
+    for (const res of [
+      { method: "gateApprove", opts: { run: "frost" } },
+      { method: "gateReject", opts: { run: "frost", feedback: "no" } },
+      { method: "budgetRaise", opts: { run: "frost", toUsd: 10 } }
+    ] as GateResolution[]) {
+      const resume = vi.fn();
+      await dispatch(fakeClient(), res, resume);
+      expect(resume).toHaveBeenCalledTimes(1);
+      expect(resume).toHaveBeenCalledWith("frost");
+    }
+  });
+
+  it("openReport and stop do NOT invoke resume", async () => {
+    for (const res of [{ method: "openReport" }, { method: "stop" }] as GateResolution[]) {
+      const resume = vi.fn();
+      await dispatch(fakeClient(), res, resume);
+      expect(resume).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("gate 'stop' action → honest cancel reporting (FIX E)", () => {
+  // Mirrors dispatchResolution's stop case (src/gates.ts) minus vscode: it now
+  // AWAITS deps.stop (which returns a CancelOutcome) and routes through
+  // cancelRunMessage — never a fire-and-forget "stopped driving".
+  async function dispatchStop(stop: (r: string) => Promise<CancelOutcome>) {
+    const outcome = await stop("frost");
+    return cancelRunMessage("frost", outcome);
+  }
+
+  it("awaits stop and reports info ONLY when the engine confirmed the stop", async () => {
+    const stop = vi.fn().mockResolvedValue({ engineStopped: true, killedChild: true });
+    const m = await dispatchStop(stop);
+    expect(stop).toHaveBeenCalledWith("frost");
+    expect(m.kind).toBe("info");
+    expect(m.text).toContain("terminally stopped");
+  });
+
+  it("reports an ERROR (not a blind success) when the engine stop FAILED", async () => {
+    const stop = vi.fn().mockResolvedValue({ engineStopped: false, killedChild: true, error: "boom" });
+    const m = await dispatchStop(stop);
+    expect(m.kind).toBe("error");
+    expect(m.text).toContain("may resume");
+    expect(m.text).toContain("boom");
   });
 });

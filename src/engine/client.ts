@@ -13,6 +13,7 @@ import { execFile } from "node:child_process";
 
 import { EngineError } from "./errors.js";
 import type {
+  AdaptersResponse,
   BudgetRaiseResult,
   BudgetShow,
   ErrorEnvelope,
@@ -25,6 +26,10 @@ import type {
   RunStatus,
   RunStopResult,
   RunsResponse,
+  SeatPauseResult,
+  SeatPauseSuccess,
+  SeatResumeResult,
+  SeatResumeSuccess,
   VersionInfo
 } from "./contract.js";
 
@@ -68,14 +73,18 @@ export class EngineClient {
     return this.config.storePath ? ["--store", this.config.storePath] : [];
   }
 
-  /** Run one `--json` command and return the raw stdout/stderr/exit. */
-  private spawnRaw(subArgs: string[]): Promise<RawResult> {
+  /** Run one `--json` command and return the raw stdout/stderr/exit. `timeoutMs`
+   *  bounds how long the client waits before SIGTERM-ing the engine; it defaults to
+   *  60000 but a long-blocking command (e.g. `seat pause`, which waits for a seat to
+   *  idle) MUST raise it above the engine's own wait so the client never kills the
+   *  engine mid-operation (FIX D). */
+  private spawnRaw(subArgs: string[], timeoutMs = 60000): Promise<RawResult> {
     const args = [this.config.enginePath, ...this.globalArgs(), ...subArgs, "--json"];
     return new Promise((resolve) => {
       execFile(
         this.config.nodePath,
         args,
-        { cwd: this.config.cwd, timeout: 60000, maxBuffer: 32 * 1024 * 1024 },
+        { cwd: this.config.cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 },
         (error, stdout, stderr) => {
           const code =
             error && typeof (error as { code?: unknown }).code === "number"
@@ -98,8 +107,8 @@ export class EngineClient {
    * Run a `--json` command and parse it into T. Throws EngineError on the engine's
    * `{ok:false,error}` envelope, on spawn failure, or on unparseable output.
    */
-  async runJson<T>(subArgs: string[]): Promise<T> {
-    const { stdout, stderr, code, spawnError } = await this.spawnRaw(subArgs);
+  async runJson<T>(subArgs: string[], timeoutMs?: number): Promise<T> {
+    const { stdout, stderr, code, spawnError } = await this.spawnRaw(subArgs, timeoutMs);
 
     if (spawnError) {
       throw new EngineError(
@@ -157,6 +166,16 @@ export class EngineClient {
 
   runs(): Promise<RunsResponse> {
     return this.runJson<RunsResponse>(["runs"]);
+  }
+
+  /** List the seat adapters the engine can actually load (authoritative — only
+   *  adapters that pass the engine's validation). Wraps `collab adapters
+   *  [--adapters-dir] --json`. Used to enumerate seat names without the thin client
+   *  reaching into the engine's adapters dir on disk. */
+  adapters(): Promise<AdaptersResponse> {
+    const args = ["adapters"];
+    if (this.config.adaptersDir) args.push("--adapters-dir", this.config.adaptersDir);
+    return this.runJson<AdaptersResponse>(args);
   }
 
   runStatus(run?: string): Promise<RunStatus> {
@@ -219,6 +238,54 @@ export class EngineClient {
     const args = ["budget", "raise", "--to", String(opts.toUsd)];
     if (opts.run) args.push("--run", opts.run);
     return this.runJson<BudgetRaiseResult>(args);
+  }
+
+  /** Take over a seat (schema 3). SETS the seat's pause flag and blocks (bounded by
+   *  `waitMs`) until the seat leaves `working`, then returns the authoritative
+   *  interactive resume spec (`session`, `sessionCwd`, `resumeCommand`,
+   *  `resumeArgs`, `ready`). On engine failure the envelope surfaces as
+   *  `{ok:false,error}` — the engine ATOMIC-FAILS (clears its own pause flag), so
+   *  the caller needs no cleanup, just surface the message + hint. Wraps
+   *  `collab seat pause <seat> [--run] [--adapters-dir] [--wait-ms] --json`. */
+  async pauseSeat(
+    seat: string,
+    run?: string,
+    opts?: { adaptersDir?: string; waitMs?: number }
+  ): Promise<SeatPauseResult> {
+    const args = ["seat", "pause", seat];
+    if (run) args.push("--run", run);
+    const adaptersDir = opts?.adaptersDir ?? this.config.adaptersDir;
+    if (adaptersDir) args.push("--adapters-dir", adaptersDir);
+    // FIX D: pin the engine's seat-idle wait to an explicit bound (default 60000 —
+    // the engine's own default) and give the client timeout a +30s margin over it,
+    // so the client can NEVER SIGTERM `seat pause` mid-wait (which would leave the
+    // seat stuck paused, its atomic-fail cleanup never reached). Client 90s > wait 60s.
+    const waitMs = opts?.waitMs ?? 60000;
+    args.push("--wait-ms", String(waitMs));
+    try {
+      return await this.runJson<SeatPauseSuccess>(args, waitMs + 30000);
+    } catch (err) {
+      if (err instanceof EngineError) {
+        return { ok: false, error: { code: err.code, message: err.message, hint: err.hint } };
+      }
+      throw err;
+    }
+  }
+
+  /** Release a taken-over seat (schema 3) — clears the pause flag so the
+   *  orchestrator resumes headless driving. Wraps `collab seat resume <seat>
+   *  [--run] --json`. */
+  async resumeSeat(seat: string, run?: string): Promise<SeatResumeResult> {
+    const args = ["seat", "resume", seat];
+    if (run) args.push("--run", run);
+    try {
+      return await this.runJson<SeatResumeSuccess>(args);
+    } catch (err) {
+      if (err instanceof EngineError) {
+        return { ok: false, error: { code: err.code, message: err.message, hint: err.hint } };
+      }
+      throw err;
+    }
   }
 }
 

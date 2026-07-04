@@ -145,7 +145,14 @@ export class CockpitPanel {
       return;
     }
     const gateVM = this.bus.runModel.gate;
-    if (!gateVM) return;
+    // Stale-click guard (FIX A): the webview button was rendered for a specific
+    // gate id (msg.gateId). If the bus has since advanced to a newer gate — or no
+    // gate pends now — refuse rather than resolve whatever gate is CURRENTLY live.
+    // A stale cockpit click must NEVER mutate a newer gate.
+    if (!gateVM || gateVM.gateId !== msg.gateId) {
+      vscode.window.showWarningMessage("Conclave: that gate already changed — refresh and try again.");
+      return;
+    }
     const spec = gateNotificationSpec(gateVM);
     const action = spec.actions.find((a) => a.id === msg.actionId);
     if (!action) return;
@@ -156,15 +163,20 @@ export class CockpitPanel {
         { ...action, winner: msg.winner ?? action.winner },
         { run, feedback: msg.feedback, amount: msg.amount }
       );
-      await dispatchResolution(resolution, {
-        client,
-        runRef: run,
-        log: (l) => this.ctx.output.appendLine(`[cockpit gate] ${l}`),
-        openReport: (r) => openReportForRun(this.ctx, r),
-        stop: (r) => {
-          void this.ctx.cancelRun(r);
-        }
-      });
+      await dispatchResolution(
+        resolution,
+        {
+          client,
+          runRef: run,
+          log: (l) => this.ctx.output.appendLine(`[cockpit gate] ${l}`),
+          openReport: (r) => openReportForRun(this.ctx, r),
+          stop: (r) => this.ctx.cancelRun(r),
+          resume: (r) => this.ctx.orchestrators.get(r)?.resume()
+        },
+        // Thread the CLICKED gate id so dispatch's confirmGateFresh re-read guards
+        // against the exact gate the webview button was built for.
+        msg.gateId
+      );
     } catch (err) {
       vscode.window.showErrorMessage(`Conclave: ${err instanceof Error ? err.message : String(err)}`);
     }

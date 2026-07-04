@@ -17,6 +17,9 @@ export interface ConclaveTreeNode {
   contextValue?: string;
   /** Run ref this node points at (for click-through commands). */
   runRef?: string;
+  /** Seat name this node represents (Seats view) — passed to seat-scoped commands
+   *  (takeover) when the node is the command argument. */
+  seat?: string;
   collapse?: NodeCollapse;
   children?: ConclaveTreeNode[];
 }

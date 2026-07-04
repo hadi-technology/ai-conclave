@@ -6,12 +6,18 @@
  * --json` event feed. Additive (unknown) keys must be ignored per the contract,
  * so every interface is intentionally open to extra fields.
  *
- * The extension speaks client schema version 1. It is compatible with an engine
- * iff  engine.minClientSchema <= CLIENT_SCHEMA_VERSION <= engine.schemaVersion.
+ * The extension speaks client schema version 3 — it CALLS schema-3 commands
+ * (`seat pause`/`seat resume`) and schema-2 ones (`run stop`, structured finding
+ * file/line, per-seat tier), so it genuinely requires an engine at schema >= 3.
+ * It is compatible with an engine iff
+ *   engine.minClientSchema <= CLIENT_SCHEMA_VERSION <= engine.schemaVersion.
+ * Declaring 3 (not 1) makes an older engine fail provisioning fast with a clear
+ * "update wrk2gthr" message, instead of passing startup then failing at runtime
+ * the moment the user invokes takeover / stop / a schema-2 read.
  */
 
-/** The client schema version this extension build speaks. */
-export const CLIENT_SCHEMA_VERSION = 1;
+/** The client schema version this extension build speaks (min engine schema it needs). */
+export const CLIENT_SCHEMA_VERSION = 3;
 
 /** Base stamp present on every read payload and watch line. */
 export interface SchemaStamped {
@@ -58,6 +64,23 @@ export interface RunSummary {
 /** `collab runs --json` */
 export interface RunsResponse extends SchemaStamped {
   runs: RunSummary[];
+}
+
+export interface AdapterTier {
+  alias: string;
+  rung: string;
+}
+
+export interface AdapterView {
+  name: string;
+  tiers: AdapterTier[];
+}
+
+/** `collab adapters --json` (schema 3 additive read) — the authoritative list of
+ *  seat adapters the engine can actually load from its --adapters-dir. The thin
+ *  client uses it to enumerate seat names instead of globbing the engine's dir. */
+export interface AdaptersResponse extends SchemaStamped {
+  adapters: AdapterView[];
 }
 
 export interface SeatRow {
@@ -274,6 +297,44 @@ export interface RunStopResult extends ActionSuccess {
   /** Terminal status the engine sets — "stopped". */
   status: string;
 }
+
+/** `collab seat pause <seat> --run <ref> --json` success (new at schema 3). The
+ *  engine SETS the seat's pause flag, WAITS for it to leave `working`, then returns
+ *  the authoritative interactive resume spec — `ready:true` guarantees paused+idle,
+ *  so the client may auto-run the resume command. */
+export interface SeatPauseSuccess extends ActionSuccess {
+  seat: string;
+  /** Vendor session id the resume attaches to. */
+  session: string;
+  /** The seat's worktree — the cwd the interactive resume must run in. */
+  sessionCwd: string;
+  /** Interactive resume binary (e.g. "claude"). */
+  resumeCommand: string;
+  /** Args for the resume binary (e.g. ["--resume","sess-abc"]). */
+  resumeArgs: string[];
+  /** Always true on success — the seat is paused AND idle, safe to attach. */
+  ready: boolean;
+}
+
+/** Failure of a seat action — the engine ATOMIC-FAILS (clears its own pause flag),
+ *  so the client needs no cleanup on this path, just surface message + hint. */
+export interface SeatActionFailure {
+  ok: false;
+  error: EngineErrorPayload;
+}
+
+/** `collab seat pause` result — success spec OR atomic failure. */
+export type SeatPauseResult = SeatPauseSuccess | SeatActionFailure;
+
+/** `collab seat resume <seat> --run <ref> --json` success (new at schema 3) —
+ *  clears the pause flag so the orchestrator resumes headless driving. */
+export interface SeatResumeSuccess extends ActionSuccess {
+  seat: string;
+  resumed: boolean;
+}
+
+/** `collab seat resume` result — success OR failure envelope. */
+export type SeatResumeResult = SeatResumeSuccess | SeatActionFailure;
 
 // ── Watch feed (collab watch --json) — JSONL line types ──────────────────────
 

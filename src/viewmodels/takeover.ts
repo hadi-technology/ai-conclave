@@ -1,34 +1,35 @@
 /**
- * Takeover hatch — pure command construction + honest gap detection (E4, item 4).
+ * Takeover hatch — pure decision logic for the REAL pause→attach→release
+ * round-trip (E4, item 4). vscode-free so it is unit-tested headlessly.
  *
- * ASSESSMENT of the JSON contract (docs/JSON-CONTRACT.md + wrk2gthr
- * src/cockpit/fleet.ts):
- *  - The seat's `session_id` IS exposed: the `collab watch --json` snapshot's
- *    `state.seats[].session`, and `collab status --json` roster `session`. So the
- *    extension CAN learn what to `--resume`.
- *  - The seat's `paused` flag IS readable (snapshot `state.seats[].paused`).
- *  - BUT there is NO contract action to SET the pause flag or run the round-trip.
- *    The engine's real takeover (`beginTakeover`/`endTakeover`) lives ONLY inside
- *    the in-process terminal cockpit and calls `store.setSeatPaused(...)` +
- *    `store.getSeat(...)` directly — never surfaced as a `collab` command. The
- *    extension must not touch the store (principle 2), so it cannot pause/resume.
+ * The engine now ships `collab seat pause/resume` (schema 3). `seat pause` SETS
+ * the seat's pause flag, WAITS for it to go idle, then returns the AUTHORITATIVE
+ * interactive resume spec (`session`, `sessionCwd`, `resumeCommand`, `resumeArgs`,
+ * `ready:true`). The contract gap is CLOSED — the extension no longer projects the
+ * resume command from the snapshot; it PREFERS the engine's returned spec.
  *
- * Therefore the HONEST takeover: we build the exact interactive resume command and
- * open it in an integrated terminal in the build target, but we DO NOT auto-run it
- * and we WARN that the harness can't be paused via the contract (double-attach
- * risk if the seat is mid-turn). The precise engine additions needed to make this
- * a real one-click round-trip are recorded in docs/ENGINE-GAPS.md.
+ * This module keeps two small pure pieces:
+ *  - {@link seatTakeoverState}: a pre-flight projection off the watch snapshot,
+ *    used only to detect "no session yet → nothing to take over" before we ask the
+ *    engine to pause.
+ *  - {@link planTakeover}: turn a `pauseSeat` result into the effect the vscode
+ *    shell performs (attach a terminal, or show an error).
+ *  - {@link releaseTracked}: release a tracked seat EXACTLY once (guards the
+ *    release-button + terminal-close double-fire).
  *
- * Pure (no vscode). The vscode shell (src/takeover.ts) creates the Terminal and
- * sends these lines.
+ * The vscode shell (src/takeover.ts) creates the Terminal and drives these.
  */
+import type { SeatPauseResult } from "../engine/contract.js";
 
 /** A seat's takeover-relevant state, projected from the watch snapshot. */
 export interface SeatTakeoverState {
   seat: string;
-  /** vendor session id to `--resume`, or null if the seat has taken no turn. */
+  /** vendor session id, or null if the seat has taken no turn (nothing to resume). */
   session: string | null;
-  /** whether the store pause flag is set (read-only via contract). */
+  /** the seat's worktree (schema 3 snapshot `sessionCwd`), or null. Pre-flight only —
+   *  the authoritative cwd for attach comes from the `pauseSeat` response. */
+  sessionCwd: string | null;
+  /** whether the store pause flag is set (read-only via the snapshot). */
   paused: boolean;
   status: string;
 }
@@ -36,7 +37,7 @@ export interface SeatTakeoverState {
 /**
  * Pull a seat's takeover state out of a watch-snapshot `state` object. The
  * snapshot's `state.seats` are cockpit `SeatView` rows carrying `session`,
- * `paused`, `status`. Returns null if the seat isn't present.
+ * `sessionCwd`, `paused`, `status`. Returns null if the seat isn't present.
  */
 export function seatTakeoverState(
   state: { seats?: Array<Record<string, unknown>> } | null | undefined,
@@ -47,113 +48,118 @@ export function seatTakeoverState(
   const row = rows.find((r) => r && (r as { seat?: unknown }).seat === seat);
   if (!row) return null;
   const session = typeof row.session === "string" ? (row.session as string) : null;
+  const sessionCwd = typeof row.sessionCwd === "string" ? (row.sessionCwd as string) : null;
   return {
     seat,
     session,
+    sessionCwd,
     paused: row.paused === true || row.paused === 1,
     status: typeof row.status === "string" ? (row.status as string) : "unknown"
   };
 }
 
-export interface TakeoverPlanInput {
-  seat: string;
-  /** From the snapshot; null when the seat has no session to resume. */
-  session: string | null;
-  /** Whether the seat is currently working a turn (double-attach risk). */
-  working: boolean;
-  /** The adapter's CLI binary (e.g. "claude"), read from the seat's adapter JSON. */
-  adapterCommand: string | null;
-  /** The build target the session was created in (resume is cwd-scoped). */
-  targetCwd: string;
+/** Pre-flight: a seat is takeable only once it has a vendor session to resume. */
+export function canTakeOver(st: SeatTakeoverState | null): boolean {
+  return !!st && !!st.session;
 }
 
-export type TakeoverPlan =
+/** The effect the vscode shell performs given a `pauseSeat` result. */
+export type TakeoverEffect =
   | {
-      kind: "resume";
+      kind: "attach";
       seat: string;
+      /** The seat's worktree — the terminal cwd (authoritative, from the engine). */
       cwd: string;
-      /** The exact interactive command, e.g. `claude --resume <session>`. */
-      resumeCommand: string;
-      /** Instruction lines to echo into the terminal before staging the command. */
-      banner: string[];
-      /** True when the seat is mid-turn — running resume now risks double-attach. */
-      warnDoubleAttach: boolean;
+      /** The exact command line to auto-run, e.g. `claude --resume sess-abc`. */
+      commandLine: string;
+      /** Vendor session id (for logging). */
+      session: string;
     }
-  | {
-      kind: "no-session";
-      seat: string;
-      cwd: string;
-      /** Why we can't build a resume command yet. */
-      banner: string[];
-    }
-  | {
-      kind: "no-adapter";
-      seat: string;
-      cwd: string;
-      banner: string[];
-    };
-
-const GAP_LINE =
-  "NOTE: the JSON contract has no seat pause/resume action, so Conclave cannot pause the harness for you.";
-const GAP_LINE2 = "See docs/ENGINE-GAPS.md for the exact engine additions a one-click round-trip needs.";
+  | { kind: "error"; message: string };
 
 /**
- * Build the honest takeover plan. Never fabricates a working round-trip: when the
- * session is known it stages (does NOT auto-run) the real `--resume` command and
- * warns; when it isn't, it explains why.
+ * Turn a `pauseSeat` envelope into the shell effect. Prefers the engine's
+ * authoritative spec: on success, attach a terminal in `sessionCwd` and auto-run
+ * `resumeCommand resumeArgs` (the engine guarantees paused+idle). On failure,
+ * surface `message` (+ ` — hint`) — the engine atomic-fails, so no cleanup.
  */
-export function buildTakeoverPlan(input: TakeoverPlanInput): TakeoverPlan {
-  const cwd = input.targetCwd;
-  if (!input.session) {
-    return {
-      kind: "no-session",
-      seat: input.seat,
-      cwd,
-      banner: [
-        `Seat "${input.seat}" has no vendor session yet (it has taken no turn) — nothing to resume.`,
-        "Wait until the seat has worked at least once, then take over.",
-        GAP_LINE,
-        GAP_LINE2
-      ]
-    };
+export function planTakeover(seat: string, res: SeatPauseResult): TakeoverEffect {
+  if (!res.ok) {
+    const { message, hint } = res.error;
+    return { kind: "error", message: message + (hint ? ` — ${hint}` : "") };
   }
-  if (!input.adapterCommand) {
-    return {
-      kind: "no-adapter",
-      seat: input.seat,
-      cwd,
-      banner: [
-        `Could not resolve the CLI command for seat "${input.seat}" (adapter JSON missing/unreadable).`,
-        `The session to resume is: ${input.session}`,
-        "Set conclave.adaptersDir to the folder holding <seat>.json adapters.",
-        GAP_LINE,
-        GAP_LINE2
-      ]
-    };
-  }
-  const resumeCommand = `${input.adapterCommand} --resume ${input.session}`;
-  const banner = [
-    `=== Conclave takeover — seat "${input.seat}" ===`,
-    `Build target: ${cwd}`,
-    `Session: ${input.session}`,
-    "",
-    "The interactive resume command is staged on the prompt below — review, then press Enter to attach.",
-    "When you finish, exit the CLI to return the terminal; then resume driving from the sidebar.",
-    ""
-  ];
-  if (input.working) {
-    banner.push(
-      "WARNING: this seat is CURRENTLY WORKING a headless turn. Attaching now double-attaches the",
-      "session. Wait until the seat is idle before pressing Enter."
-    );
-  }
-  banner.push(GAP_LINE, GAP_LINE2);
   return {
-    kind: "resume",
-    seat: input.seat,
-    cwd,
-    resumeCommand,
-    banner,
-    warnDoubleAttach: input.working
+    kind: "attach",
+    seat,
+    cwd: res.sessionCwd,
+    // Shell-quote every token so a command path with a space (e.g.
+    // "/My Tools/codex") or a shell metachar in an arg reaches argv as ONE
+    // token. Assumes a POSIX shell (bash/zsh) — acceptable: resumeCommand/
+    // resumeArgs are engine-controlled and macOS/Linux is the supported env.
+    commandLine: [res.resumeCommand, ...res.resumeArgs].map(posixQuote).join(" "),
+    session: res.session
   };
+}
+
+/**
+ * POSIX shell-quote a single token. Leaves shell-safe tokens untouched; wraps
+ * anything with a metachar in single quotes (escaping any embedded `'`). Pure —
+ * unit-tested. Assumes a POSIX shell (bash/zsh), the supported target platform.
+ */
+export function posixQuote(s: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Release a tracked takeover EXACTLY once on SUCCESS, retryable on failure.
+ * Guards the double-fire ("Release seat" button AND the terminal-close listener)
+ * with an in-flight `releasing` flag, and only removes the registry entry AFTER
+ * `resume` resolves — so a failed resume KEEPS the entry, letting the user retry
+ * release (via the button or by closing the terminal). Re-throws on failure so
+ * the shell surfaces the error. Returns true iff it performed the resume.
+ */
+export async function releaseTracked<T extends { run: string; releasing?: boolean }>(
+  registry: Map<string, T>,
+  seat: string,
+  resume: (seat: string, run: string) => Promise<unknown>
+): Promise<boolean> {
+  const entry = registry.get(seat);
+  if (!entry) return false;
+  if (entry.releasing) return false; // a release is already in flight — suppress the double-fire
+  entry.releasing = true;
+  try {
+    await resume(seat, entry.run);
+    registry.delete(seat);
+    return true;
+  } catch (err) {
+    entry.releasing = false; // keep the entry so the user CAN retry release
+    throw err;
+  }
+}
+
+/**
+ * Shutdown drain (deactivate / window reload): resume EVERY tracked seat so none is
+ * left with its engine pause flag stuck set. Each resume is awaited but its failure is
+ * SWALLOWED (reported via `onError`) — one seat failing must not block the others, and
+ * the drain must NEVER throw (shutdown can't hang or crash). Clears the registry at the
+ * end regardless of individual failures. Bounded by the caller's `resume` (the client
+ * carries its own spawn timeout). Pure (vscode-free) → unit-tested with a fake resume.
+ */
+export async function drainTakeovers<T extends { run: string }>(
+  registry: Map<string, T>,
+  resume: (seat: string, run: string) => Promise<void>,
+  onError?: (seat: string, err: unknown) => void
+): Promise<void> {
+  const entries = [...registry.entries()];
+  await Promise.all(
+    entries.map(async ([seat, entry]) => {
+      try {
+        await resume(seat, entry.run);
+      } catch (err) {
+        onError?.(seat, err);
+      }
+    })
+  );
+  registry.clear();
 }

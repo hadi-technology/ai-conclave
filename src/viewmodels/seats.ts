@@ -36,6 +36,7 @@ export function seatsTree(seats: SeatVM[]): ConclaveTreeNode[] {
       return {
         key: `seat.${s.seat}`,
         label: s.seat,
+        seat: s.seat,
         description: bits.join(" · "),
         tooltip: [`${s.seat} — ${chip}`, ...detail].join("\n") || undefined,
         icon,
@@ -43,4 +44,21 @@ export function seatsTree(seats: SeatVM[]): ConclaveTreeNode[] {
         collapse: "none"
       };
     });
+}
+
+/**
+ * Extract the seat name a seat-scoped command was invoked with. The Seats tree passes
+ * its `ConclaveTreeNode` (carrying `seat`, and `label` = seat name) when the command
+ * fires from a tree item; a plain string is honored too. Returns undefined when no
+ * seat can be resolved (e.g. the title-bar button) → the caller falls back to a picker.
+ * Pure — unit-tested.
+ */
+export function seatArgOf(arg: unknown): string | undefined {
+  if (typeof arg === "string") return arg;
+  if (arg && typeof arg === "object") {
+    const o = arg as { seat?: unknown; label?: unknown };
+    if (typeof o.seat === "string") return o.seat;
+    if (typeof o.label === "string") return o.label;
+  }
+  return undefined;
 }

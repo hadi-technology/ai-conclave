@@ -8,9 +8,12 @@ import * as vscode from "vscode";
 
 import type { EngineClient } from "./engine/client.js";
 import type { GateVM } from "./viewmodels/model.js";
+import { cancelRunMessage, type CancelOutcome } from "./viewmodels/stop.js";
 import {
   gateNotificationSpec,
+  gateStillPending,
   resolveGateCall,
+  resolutionClearsGate,
   type GateActionSpec,
   type GateResolution
 } from "./viewmodels/gate.js";
@@ -21,8 +24,14 @@ export interface GateUxDeps {
   log: (line: string) => void;
   /** Called for an openReport resolution. */
   openReport: (runRef: string) => Promise<void>;
-  /** Called for a stop resolution (tears down orchestrate + watch). */
-  stop: (runRef: string) => void;
+  /** Called for a stop resolution (engine-side terminal stop + tear down the
+   *  orchestrate child). Returns the honest outcome so the UX reports success
+   *  ONLY when the engine confirmed it (mirrors the command path's cancelRun). */
+  stop: (runRef: string) => Promise<CancelOutcome>;
+  /** Re-spawn the orchestrate child after a gate-CLEARING action, so the run
+   *  continues (the child exited idling on the gate). A safe no-op for
+   *  attached-only runs with no controller. */
+  resume?: (runRef: string) => void;
 }
 
 /** Present a pending gate natively and resolve the human's choice. */
@@ -41,7 +50,10 @@ export async function presentGate(gate: GateVM, deps: GateUxDeps): Promise<void>
   const action = spec.actions.find((a) => a.label === picked);
   if (!action) return;
 
-  await runGateAction(action, deps);
+  // Thread the gate id THIS notification was built for, so the dispatch can refuse
+  // to mutate if the run has since advanced to a different gate (stale-notification
+  // TOCTOU — the notification may sit for a while before the user clicks).
+  await runGateAction(action, deps, spec.gateId);
 }
 
 async function collectInputs(
@@ -75,7 +87,7 @@ async function collectInputs(
   return out;
 }
 
-async function runGateAction(action: GateActionSpec, deps: GateUxDeps): Promise<void> {
+async function runGateAction(action: GateActionSpec, deps: GateUxDeps, actedGateId?: number): Promise<void> {
   const inputs = await collectInputs(action, deps.runRef);
   if (inputs === null) return; // cancelled
 
@@ -87,11 +99,49 @@ async function runGateAction(action: GateActionSpec, deps: GateUxDeps): Promise<
     return;
   }
 
-  await dispatchResolution(resolution, deps);
+  await dispatchResolution(resolution, deps, actedGateId);
 }
 
-/** Dispatch a resolved gate call to the engine client. Exported for reuse/tests. */
-export async function dispatchResolution(resolution: GateResolution, deps: GateUxDeps): Promise<void> {
+/**
+ * Defensive re-check before a mutating gate call: re-read `gate show` and confirm the
+ * still-pending gate is the SAME one the user acted on. Refuses (and tells the user to
+ * refresh) if the gate changed or none pends now — never blindly mutates a stale gate.
+ * Returns true when it is safe to proceed. Only applied to gate-mutating methods.
+ */
+async function confirmGateFresh(deps: GateUxDeps, actedGateId: number): Promise<boolean> {
+  let current;
+  try {
+    current = await deps.client.gateShow(deps.runRef);
+  } catch (err) {
+    deps.log(`gate freshness check failed: ${err instanceof Error ? err.message : String(err)}`);
+    void vscode.window.showInformationMessage(
+      "Conclave: couldn't confirm the gate is still current — refresh and try again."
+    );
+    return false;
+  }
+  if (!gateStillPending(actedGateId, current)) {
+    void vscode.window.showInformationMessage("Conclave: that gate already changed — refresh and try again.");
+    return false;
+  }
+  return true;
+}
+
+/** Dispatch a resolved gate call to the engine client. Exported for reuse/tests.
+ *  `actedGateId` is the id the surface (notification/cockpit button) was built for;
+ *  when given, a mutating call is guarded by {@link confirmGateFresh} so a stale
+ *  surface can't resolve a gate the run has already moved past. */
+export async function dispatchResolution(
+  resolution: GateResolution,
+  deps: GateUxDeps,
+  actedGateId?: number
+): Promise<void> {
+  // Stale-notification guard: for the gate-CLEARING mutations, verify the pending
+  // gate id still matches before mutating. Read-only (openReport) / teardown (stop)
+  // don't touch a specific gate, so they skip the check.
+  if (actedGateId != null && resolutionClearsGate(resolution.method)) {
+    if (!(await confirmGateFresh(deps, actedGateId))) return;
+  }
+
   switch (resolution.method) {
     case "gateApprove": {
       const r = await deps.client.gateApprove(resolution.opts);
@@ -114,9 +164,22 @@ export async function dispatchResolution(resolution: GateResolution, deps: GateU
     case "openReport":
       await deps.openReport(deps.runRef);
       break;
-    case "stop":
-      deps.stop(deps.runRef);
-      vscode.window.showInformationMessage(`Conclave: stopped driving "${deps.runRef}".`);
+    case "stop": {
+      // Honest reporting (FIX E): the stop can fail engine-side — surface the same
+      // info-or-error message the command path does, never a blind "stopped".
+      const outcome = await deps.stop(deps.runRef);
+      const m = cancelRunMessage(deps.runRef, outcome);
+      if (m.kind === "info") {
+        vscode.window.showInformationMessage(m.text);
+      } else {
+        vscode.window.showErrorMessage(m.text);
+      }
       break;
+    }
   }
+
+  // A gate-clearing action succeeded above (a client throw would have escaped
+  // before here) → re-spawn the orchestrate child so the gated run continues.
+  // openReport/stop don't clear a gate, so they never re-spawn.
+  if (resolutionClearsGate(resolution.method)) deps.resume?.(deps.runRef);
 }

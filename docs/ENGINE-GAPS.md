@@ -7,11 +7,13 @@ below states **what E4 wanted**, **what the contract exposes**, **how E4 copes**
 **the precise engine addition** that would let E4 stop coping. None of these are
 worked around by touching the store — the extension never opens the DB (principle 2).
 
-**Status (schema 2).** The engine's schema-2 bump **CLOSED gaps 1 and 2**, plus the
+**Status (schema 3).** The engine's schema-2 bump **CLOSED gaps 1 and 2**, plus the
 two smaller gaps that were noted only in `TESTING.md` — **per-seat `tier`** (Seats
-column) and **`collab run stop`** (real engine-side cancel). The extension now
-consumes all of them (structured `file`/`line`, `workingDir`/`target`, roster `tier`,
-`run stop`). **Gap 3 — takeover pause/resume — remains the one open gap.**
+column) and **`collab run stop`** (real engine-side cancel). The **schema-3** bump
+then **CLOSED gap 3** — the `collab seat pause/resume` command group now drives a real
+one-click takeover round-trip. The extension consumes all of them (structured
+`file`/`line`, `workingDir`/`target`, roster `tier`, `run stop`, and now `seat
+pause`/`seat resume` + snapshot `sessionCwd`). **There are no open contract gaps.**
 
 ---
 
@@ -55,58 +57,36 @@ wrong-tree provenance guard (`navigableTarget`) is retained.
 
 ---
 
-## Gap 3 — takeover has no pause/resume action (the big one) — ⏳ STILL OPEN
+## Gap 3 — takeover pause/resume action (the big one) — ✅ CLOSED (schema 3)
 
 **Wanted (roadmap E4):** "Take over seat" → open interactive
 `claude --resume <session>` in an integrated terminal after signalling the harness to
 **pause** that seat; "Release" → resume the seat headless. The M0-proven round-trip,
 in-editor.
 
-**Contract today — assessed carefully:**
-- The seat's **`session` IS exposed** — watch snapshot `state.seats[].session` and
-  `status --json` roster `session`. So the extension **can** build the exact
-  `<cli> --resume <session>` command.
-- The seat's **`paused` flag IS readable** — watch snapshot `state.seats[].paused`.
-- **BUT there is NO action command to SET pause/resume or run the takeover.** The
-  engine's real takeover (`beginTakeover` / `endTakeover` in
-  `src/cockpit/fleet.ts`) calls `store.setSeatPaused(seat, …)` and reads
-  `store.getSeat(seat).session_id` **directly, in-process** — it is only reachable
-  from the terminal cockpit's own keypress, never surfaced as a `collab …` command.
-  The extension must not touch the store (principle 2), so it **cannot** pause the
-  harness, and therefore cannot safely own the round-trip.
+**Contract now (schema 3):** the engine ships a `collab seat` command group plus a
+snapshot addition:
+- `collab seat pause <seat> --run <ref> [--adapters-dir <dir>] [--wait-ms <n>] --json`
+  → **SETS** the seat's pause flag, **WAITS** (bounded by `--wait-ms`, default 60000)
+  for the seat to leave `working`, then returns the authoritative interactive resume
+  spec: `{ seat, session, sessionCwd, resumeCommand, resumeArgs, ready }`. `ready:true`
+  guarantees the seat is paused **AND** idle, so the client can **auto-run** the resume
+  command safely (no double-attach). On failure (no session yet / still mid-turn past
+  wait / no such seat) it exits 2 with `{ok:false,error:{code,message,hint}}` and
+  **atomic-fails** (clears its own pause flag) — the client needs no cleanup.
+- `collab seat resume <seat> --run <ref> --json` → `{seat, resumed:true}`; clears the
+  pause flag so the orchestrator resumes headless driving.
+- The watch/`--json` snapshot `SeatView` now also carries `sessionCwd` (the seat's
+  worktree) alongside `paused` and `session`.
 
-**How E4 copes (honest, not faked):** `Conclave: Take over seat` reads the seat's
-`session`/`status` from the live snapshot, reads the adapter's `command` from the
-seat's adapter JSON, and opens an integrated Terminal **in the build target** that:
-1. echoes a clear banner explaining the state + **the contract gap**;
-2. **stages** the real `<cli> --resume <session>` on the prompt — it does **not**
-   auto-run it — so the user reviews and presses Enter to attach;
-3. **warns about double-attach** when the seat is mid-turn (Conclave can't pause it,
-   so attaching now would double-attach the session);
-4. reports honestly when there's no session yet, or the adapter command is
-   unreadable — never a silent no-op.
-
-This is real and useful (you land in an interactive session in the right cwd with the
-right command) but it is **not** the safe, one-click pause→steer→release round-trip
-the roadmap ultimately wants, because the engine won't let an out-of-process client
-pause the harness.
-
-**Engine additions needed (to make takeover a true one-click round-trip):**
-1. `collab seat pause --seat <s> [--run <ref>] --json` and
-   `collab seat resume --seat <s> [--run <ref>] --json` — action-envelope commands
-   that set/clear the store pause flag (wrapping the existing `setSeatPaused`), and,
-   ideally, block on pause until the seat's current turn drains (as `beginTakeover`
-   already does internally) so it's safe to attach.
-2. A `collab seat takeover-spec --seat <s> [--run <ref>] --json` read that returns
-   the ready-to-run spec `{ command, args, cwd, sessionId }` (mirroring
-   `beginTakeover`'s return) so the client doesn't have to read adapter JSON or guess
-   the session cwd. Equivalently, add `sessionCwd` to the snapshot seat rows
-   (`session_cwd` exists in the store) so the client can build it itself.
-3. Optionally a `takeover_start` / `takeover_end` pair already exists as store
-   events; surfacing them on the watch feed would let the UI reflect an in-progress
-   takeover.
-
-With (1)+(2) the extension can: call `seat pause` (envelope confirms drained) →
-open the terminal with the returned spec → on terminal close call `seat resume`. All
-through the contract, no store access. Until then E4 ships the honest terminal hatch
-above.
+**How E4 consumes it (real one-click round-trip):** `Conclave: Take over seat` calls
+`engine.pauseSeat(seat, run, {adaptersDir})`. On the ok spec it opens an integrated
+Terminal **in `sessionCwd`** and **auto-runs** `resumeCommand resumeArgs` (safe —
+`ready:true`). The user drives the seat by hand. **Release** — via a "Release seat"
+button on the info toast, a `conclave.releaseSeat` command, OR simply closing the
+terminal — calls `engine.resumeSeat(seat, run)` and headless driving resumes; the
+release path is guarded to resume **exactly once**. On pause failure the extension
+surfaces `message` (+ ` — hint`) and does nothing else (the engine atomic-failed). The
+extension **prefers the engine's authoritative spec** over the old snapshot
+projection; the snapshot is used only for the pre-flight "no session yet → nothing to
+take over" check. All through the contract, no store access.

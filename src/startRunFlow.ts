@@ -7,7 +7,6 @@
  * All the non-UI logic (arg building, preflight text, validation) lives in the
  * pure view-model (viewmodels/startRun.ts); this file is only the vscode plumbing.
  */
-import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +16,7 @@ import type { EngineClient } from "./engine/client.js";
 import { prepareBuildTarget } from "./buildTarget.js";
 import {
   buildStartRunArgs,
+  discoverSeats,
   planBuildTarget,
   preflightText,
   requiresPreflightConfirm,
@@ -36,18 +36,6 @@ export interface StartRunFlowResult {
 /** OS-temp root for per-run isolated scratch build clones. */
 export function scratchRoot(): string {
   return join(tmpdir(), "conclave-builds");
-}
-
-/** Discover seats from an adapters dir (`<seat>.json` files). */
-export function discoverSeats(adaptersDir: string): string[] {
-  try {
-    return readdirSync(adaptersDir)
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => f.replace(/\.json$/, ""))
-      .sort();
-  } catch {
-    return [];
-  }
 }
 
 async function pickFromEnum(
@@ -83,9 +71,9 @@ export async function runStartFlow(
   });
   if (criteria === undefined) return undefined;
 
-  // Seats: offer discovered adapters as a multi-pick, else free text.
-  const adaptersDir = cfg.get<string>("adaptersDir", "").trim() || join(cwd, "adapters");
-  const discovered = existsSync(adaptersDir) ? discoverSeats(adaptersDir) : [];
+  // Seats: ask the engine which adapters it can load, offer them as a multi-pick,
+  // else free text. On any engine error discoverSeats returns [] → free-text path.
+  const discovered = await discoverSeats(client);
   const defaultSeats = cfg.get<string>("defaultSeats", "").trim();
   let seats: string;
   if (discovered.length > 0) {
